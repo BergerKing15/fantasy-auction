@@ -52,7 +52,7 @@ FLEX_SPLIT = {"RB": 0.40, "WR": 0.50, "TE": 0.10}
 # Lowering replacement level to include bench depth is what keeps values realistic —
 # only ~80 players have PAR if you use starter counts alone, concentrating all
 # dollars at the top. Bench depth spreads the pool to ~150 players.
-BENCH_DEPTH = {"QB": 1.5, "RB": 3.5, "WR": 3.5, "TE": 2.0}
+BENCH_DEPTH = {"QB": 1.5, "RB": 3.5, "WR": 4.5, "TE": 2.5}
 
 # How many seasons of history to weight together for the empirical estimate
 SEASONS_USED = 3
@@ -69,20 +69,32 @@ SHRINKAGE_K = 8.0
 # How much ADP-implied value blends into the final auction value (0=pure PAR, 1=pure ADP).
 # ADP implicitly captures team context, target share, schedule, and injury risk that
 # our stat model can't see. 0.5 gives equal weight to both signals.
-ADP_BLEND = 0.5
+ADP_BLEND = 0.85
 
 DATA_DIR = "data"
 
 
 # ─── ADP Blend ────────────────────────────────────────────────────────────────
 
-def _adp_to_value(rank: float, budget: int = 200, n_slots: int = 192) -> float:
-    """Convert ADP rank to implied auction value via log-linear decay.
-    Calibrated so rank 1 ≈ 25% of budget, rank n_slots ≈ $1.
+# Position-specific auction value targets derived from RotoWire 12-team $200 PPR ranges.
+# top/bottom = top-1 and top-10 values; k derived as (top-bottom)/ln(10).
+POS_ADP_PARAMS = {
+    "QB":  {"top": 17, "bottom":  4, "k": (17 -  4) / np.log(10)},
+    "RB":  {"top": 43, "bottom": 26, "k": (43 - 26) / np.log(10)},
+    "WR":  {"top": 25, "bottom": 12, "k": (25 - 12) / np.log(10)},
+    "TE":  {"top": 13, "bottom":  2, "k": (13 -  2) / np.log(10)},
+    "K":   {"top":  2, "bottom":  1, "k": 0.1},
+    "DST": {"top":  3, "bottom":  1, "k": (3 - 1) / np.log(10)},
+}
+
+
+def _pos_adp_value(pos: str, pos_rank: int) -> float:
+    """Position-specific implied auction value from ADP rank.
+    Slope k is calibrated so top-1 = 'top' and top-10 = 'bottom' from RotoWire ranges.
+    Curve continues log-linearly below rank 10, floored at $1.
     """
-    top = budget * 0.25          # top pick worth ~25% of budget
-    b   = (top - 1.0) / np.log(max(n_slots, 2))
-    return max(1.0, top - b * np.log(max(rank, 1)))
+    p = POS_ADP_PARAMS.get(pos, POS_ADP_PARAMS["WR"])
+    return max(1.0, p["top"] - p["k"] * np.log(max(pos_rank, 1)))
 
 
 def _clean_adp_name(raw: str) -> str:
@@ -93,53 +105,48 @@ def _clean_adp_name(raw: str) -> str:
 
 
 def blend_adp(result: pd.DataFrame, adp_path: str,
-              blend: float = ADP_BLEND, league: dict = LEAGUE) -> pd.DataFrame:
+              blend: float = ADP_BLEND) -> pd.DataFrame:
     """
-    Blend PAR-based auction values with ADP-implied values.
-    Players not found in ADP (depth/bench players) keep their PAR value.
-    After blending, rescales so top-N values still sum to the total budget.
+    Blend PAR-based values with position-specific ADP-implied values.
+    ADP implied values are calibrated per position to RotoWire market ranges,
+    capturing positional scarcity (RBs worth more than WRs in PPR even at same ADP rank).
     """
     if blend == 0 or not os.path.exists(adp_path):
         return result
 
     adp_df = pd.read_csv(adp_path)
-    ppr    = adp_df[adp_df["scoring_format"] == "ppr"].copy()
-    ppr    = ppr.dropna(subset=["Rank"])
-    ppr["adp_name"]  = ppr["PlayerTeam (Bye)"].apply(_clean_adp_name)
-    ppr["adp_value"] = ppr["Rank"].apply(
-        lambda r: _adp_to_value(r, budget=league["budget"])
-    )
+    ppr = adp_df[adp_df["scoring_format"] == "ppr"].copy()
+    ppr = ppr.dropna(subset=["Rank", "POS"])
+
+    # Parse position and position-specific rank from POS column (e.g. "RB3" → pos=RB, rank=3)
+    ppr["pos"]      = ppr["POS"].str.extract(r"^([A-Z]+)")[0]
+    ppr["pos_rank"] = pd.to_numeric(ppr["POS"].str.extract(r"(\d+)$")[0], errors="coerce").fillna(999).astype(int)
+    ppr["adp_name"] = ppr["PlayerTeam (Bye)"].apply(_clean_adp_name)
+    ppr["adp_value"] = ppr.apply(lambda r: _pos_adp_value(r["pos"], r["pos_rank"]), axis=1)
+
     adp_lookup = ppr.set_index("adp_name")["adp_value"].to_dict()
 
     df = result.copy()
-    df["_match"] = df["player_name"].str.lower().str.strip()
+    df["_match"]      = df["player_name"].str.lower().str.strip()
+    df["_match_bare"] = df["_match"].str.replace(
+        r"\s+(jr\.?|sr\.?|i{2,3}v?|iv)$", "", regex=True, flags=re.IGNORECASE
+    ).str.strip()
 
-    # Strip name suffixes (Jr., Sr., II, III, IV) for fallback matching
-    df["_match_bare"] = df["_match"].str.replace(r"\s+(jr\.?|sr\.?|i{2,3}v?|iv)$", "", regex=True, flags=re.IGNORECASE).str.strip()
+    df["adp_value"] = df.apply(
+        lambda r: adp_lookup.get(r["_match"]) or adp_lookup.get(r["_match_bare"]),
+        axis=1,
+    )
 
-    def lookup(row):
-        return adp_lookup.get(row["_match"]) or adp_lookup.get(row["_match_bare"])
-
-    df["adp_value"] = df.apply(lookup, axis=1)
-
-    has_adp = df["adp_value"].notna()
+    # Only blend players who have meaningful PAR history (auction_value > $1).
+    # Rookies and depth players at $1 PAR would get inflated by high ADP values,
+    # bloating the pre-rescale total and crushing everyone else down.
+    has_adp = df["adp_value"].notna() & (df["auction_value"] > 1.0)
     df.loc[has_adp, "auction_value"] = (
         blend * df.loc[has_adp, "adp_value"] +
         (1 - blend) * df.loc[has_adp, "auction_value"]
     ).clip(lower=1.0).round(1)
 
     df.drop(columns=["_match", "_match_bare", "adp_value"], inplace=True)
-
-    # Rescale meaningful values so the top-N still sums to the full league budget.
-    # Only scale players above $1 — don't inflate the bench/depth floor.
-    n_slots     = league["teams"] * (sum(league["roster"].values()) + league.get("bench", 6) + league.get("IR", 1))
-    target_sum  = league["teams"] * league["budget"]
-    top_n       = df.nlargest(n_slots, "auction_value")
-    current_sum = top_n["auction_value"].sum()
-    if current_sum > 0:
-        scale = target_sum / current_sum
-        above = df["auction_value"] > 1.0
-        df.loc[above, "auction_value"] = (df.loc[above, "auction_value"] * scale).clip(lower=1.01).round(1)
 
     return df
 
