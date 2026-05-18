@@ -426,15 +426,88 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
     adp_path = os.path.join(DATA_DIR, "adp.csv")
     result = blend_adp(result, adp_path)
 
-    # Attach PPR ADP rank for display
+    # Inject ADP players missing from projections (rookies + name-mismatch players).
+    # These have no historical stats so get ADP-implied value and position prior for fpts.
+    if os.path.exists(adp_path):
+        adp_df  = pd.read_csv(adp_path)
+        ppr_adp = adp_df[adp_df["scoring_format"] == "ppr"].dropna(subset=["Rank", "POS"]).copy()
+        ppr_adp["pos"]      = ppr_adp["POS"].str.extract(r"^([A-Z]+)")[0]
+        ppr_adp["pos_rank"] = pd.to_numeric(ppr_adp["POS"].str.extract(r"(\d+)$")[0], errors="coerce").fillna(999).astype(int)
+        ppr_adp["adp_name"] = ppr_adp["PlayerTeam (Bye)"].apply(_clean_adp_name)
+
+        # Players already in result (by cleaned name or bare name)
+        result["_clean"] = result["player_name"].str.lower().str.strip()
+        result["_bare"]  = result["_clean"].str.replace(
+            r"\s+(jr\.?|sr\.?|i{2,3}v?|iv)$", "", regex=True, flags=re.IGNORECASE
+        ).str.strip()
+        covered = set(result["_clean"]) | set(result["_bare"])
+
+        # Exclude known data artifacts (e.g. "Patrick Mahomes I" = his father, not the QB)
+        EXCLUDE = {"patrick mahomes i"}
+        missing_adp = ppr_adp[
+            ~ppr_adp["adp_name"].isin(covered) &
+            ~ppr_adp["adp_name"].isin(EXCLUDE) &
+            ppr_adp["pos"].isin(["QB", "RB", "WR", "TE"])
+        ].copy()
+
+        if len(missing_adp) > 0:
+            # Compute position priors for rookie projected points
+            prior_seasons = [y for y in range(projection_season - 8, projection_season) if y <= 2025]
+            priors = compute_position_priors(stats, ppr=ppr, train_seasons=prior_seasons)
+            # Rookie prior: youngest age bracket
+            rookie_prior = {
+                pos: priors.get((pos, "rookie"), priors.get((pos, "unknown"),
+                    next((v for (p, _), v in priors.items() if p == pos), 0.0)))
+                for pos in ["QB", "RB", "WR", "TE"]
+            }
+
+            rows = []
+            for _, row in missing_adp.iterrows():
+                pos = row["pos"]
+                adp_val = _pos_adp_value(pos, int(row["pos_rank"]))
+                ppg     = rookie_prior.get(pos, 10.0)
+                rows.append({
+                    "player_id":      f"adp_{row['adp_name'].replace(' ', '_')}",
+                    "player_name":    _clean_adp_name(str(row["PlayerTeam (Bye)"])).title(),
+                    "position":       pos,
+                    "auction_value":  round(adp_val, 1),
+                    "projected_fpts": round(ppg * 17, 1),
+                    "ppg":            round(ppg, 2),
+                    "seasons":        0,
+                    "total_games":    0,
+                    "adp_rank":       float(row["Rank"]),
+                    "years_of_experience": 0,
+                })
+            if rows:
+                result = pd.concat([result, pd.DataFrame(rows)], ignore_index=True)
+
+        result.drop(columns=["_clean", "_bare"], inplace=True)
+
+    # Attach PPR ADP rank for any players still missing it
     if os.path.exists(adp_path):
         adp_df  = pd.read_csv(adp_path)
         ppr_adp = adp_df[adp_df["scoring_format"] == "ppr"][["Rank", "PlayerTeam (Bye)"]].copy()
+        # _clean_adp_name already strips suffixes (Jr/Sr/III/IV) from ADP names
         ppr_adp["_match"] = ppr_adp["PlayerTeam (Bye)"].apply(_clean_adp_name)
         ppr_adp = ppr_adp.rename(columns={"Rank": "adp_rank"})
-        result["_match"] = result["player_name"].str.lower().str.strip()
-        result = result.merge(ppr_adp[["_match", "adp_rank"]], on="_match", how="left")
-        result.drop(columns=["_match"], inplace=True)
+        no_rank = result["adp_rank"].isna() if "adp_rank" in result.columns else pd.Series(True, index=result.index)
+        if no_rank.any():
+            result["_match"]      = result["player_name"].str.lower().str.strip()
+            result["_match_bare"] = result["_match"].str.replace(
+                r"\s+(jr\.?|sr\.?|i{2,3}v?|iv)$", "", regex=True, flags=re.IGNORECASE
+            ).str.strip()
+            # Pass 1: exact name match
+            rank_fill = result[no_rank].merge(ppr_adp[["_match", "adp_rank"]], on="_match", how="left", suffixes=("_old", ""))
+            result.loc[no_rank, "adp_rank"] = rank_fill["adp_rank"].values
+            # Pass 2: bare name match (strips Jr/Sr/III/IV so "Kenneth Walker III" -> "kenneth walker")
+            still_missing = result["adp_rank"].isna()
+            if still_missing.any():
+                rank_fill2 = result[still_missing].merge(
+                    ppr_adp[["_match", "adp_rank"]].rename(columns={"_match": "_match_bare"}),
+                    on="_match_bare", how="left", suffixes=("_old", ""),
+                )
+                result.loc[still_missing, "adp_rank"] = rank_fill2["adp_rank"].values
+            result.drop(columns=["_match", "_match_bare"], errors="ignore", inplace=True)
 
     # Merge years_of_experience from players for display in dashboard
     if not players.empty and "years_of_experience" in players.columns:
