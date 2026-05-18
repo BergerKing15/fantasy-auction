@@ -8,6 +8,7 @@ Outputs: data/projections.csv
 """
 
 import os
+import re
 import pandas as pd
 import numpy as np
 
@@ -65,7 +66,82 @@ RECENCY_WEIGHTS = {0: 1.0, 1: 0.7, 2: 0.4}
 # K=8: a player with 3 full seasons (51 games) gets 86% empirical weight.
 SHRINKAGE_K = 8.0
 
+# How much ADP-implied value blends into the final auction value (0=pure PAR, 1=pure ADP).
+# ADP implicitly captures team context, target share, schedule, and injury risk that
+# our stat model can't see. 0.5 gives equal weight to both signals.
+ADP_BLEND = 0.5
+
 DATA_DIR = "data"
+
+
+# ─── ADP Blend ────────────────────────────────────────────────────────────────
+
+def _adp_to_value(rank: float, budget: int = 200, n_slots: int = 192) -> float:
+    """Convert ADP rank to implied auction value via log-linear decay.
+    Calibrated so rank 1 ≈ 25% of budget, rank n_slots ≈ $1.
+    """
+    top = budget * 0.25          # top pick worth ~25% of budget
+    b   = (top - 1.0) / np.log(max(n_slots, 2))
+    return max(1.0, top - b * np.log(max(rank, 1)))
+
+
+def _clean_adp_name(raw: str) -> str:
+    """Strip team abbreviation, bye week, and name suffixes from FantasyPros player string."""
+    name = re.sub(r"[A-Z]{2,3}\(.*?\)\s*$", "", raw).strip()
+    name = re.sub(r"\s+(Jr\.?|Sr\.?|I{2,3}V?|IV)$", "", name, flags=re.IGNORECASE).strip()
+    return name.lower()
+
+
+def blend_adp(result: pd.DataFrame, adp_path: str,
+              blend: float = ADP_BLEND, league: dict = LEAGUE) -> pd.DataFrame:
+    """
+    Blend PAR-based auction values with ADP-implied values.
+    Players not found in ADP (depth/bench players) keep their PAR value.
+    After blending, rescales so top-N values still sum to the total budget.
+    """
+    if blend == 0 or not os.path.exists(adp_path):
+        return result
+
+    adp_df = pd.read_csv(adp_path)
+    ppr    = adp_df[adp_df["scoring_format"] == "ppr"].copy()
+    ppr    = ppr.dropna(subset=["Rank"])
+    ppr["adp_name"]  = ppr["PlayerTeam (Bye)"].apply(_clean_adp_name)
+    ppr["adp_value"] = ppr["Rank"].apply(
+        lambda r: _adp_to_value(r, budget=league["budget"])
+    )
+    adp_lookup = ppr.set_index("adp_name")["adp_value"].to_dict()
+
+    df = result.copy()
+    df["_match"] = df["player_name"].str.lower().str.strip()
+
+    # Strip name suffixes (Jr., Sr., II, III, IV) for fallback matching
+    df["_match_bare"] = df["_match"].str.replace(r"\s+(jr\.?|sr\.?|i{2,3}v?|iv)$", "", regex=True, flags=re.IGNORECASE).str.strip()
+
+    def lookup(row):
+        return adp_lookup.get(row["_match"]) or adp_lookup.get(row["_match_bare"])
+
+    df["adp_value"] = df.apply(lookup, axis=1)
+
+    has_adp = df["adp_value"].notna()
+    df.loc[has_adp, "auction_value"] = (
+        blend * df.loc[has_adp, "adp_value"] +
+        (1 - blend) * df.loc[has_adp, "auction_value"]
+    ).clip(lower=1.0).round(1)
+
+    df.drop(columns=["_match", "_match_bare", "adp_value"], inplace=True)
+
+    # Rescale meaningful values so the top-N still sums to the full league budget.
+    # Only scale players above $1 — don't inflate the bench/depth floor.
+    n_slots     = league["teams"] * (sum(league["roster"].values()) + league.get("bench", 6) + league.get("IR", 1))
+    target_sum  = league["teams"] * league["budget"]
+    top_n       = df.nlargest(n_slots, "auction_value")
+    current_sum = top_n["auction_value"].sum()
+    if current_sum > 0:
+        scale = target_sum / current_sum
+        above = df["auction_value"] > 1.0
+        df.loc[above, "auction_value"] = (df.loc[above, "auction_value"] * scale).clip(lower=1.01).round(1)
+
+    return df
 
 
 # ─── Fantasy Points ────────────────────────────────────────────────────────────
@@ -338,6 +414,20 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
 
     print("Computing auction values...")
     result = compute_auction_values(projections)
+
+    print("Blending ADP...")
+    adp_path = os.path.join(DATA_DIR, "adp.csv")
+    result = blend_adp(result, adp_path)
+
+    # Attach PPR ADP rank for display
+    if os.path.exists(adp_path):
+        adp_df  = pd.read_csv(adp_path)
+        ppr_adp = adp_df[adp_df["scoring_format"] == "ppr"][["Rank", "PlayerTeam (Bye)"]].copy()
+        ppr_adp["_match"] = ppr_adp["PlayerTeam (Bye)"].apply(_clean_adp_name)
+        ppr_adp = ppr_adp.rename(columns={"Rank": "adp_rank"})
+        result["_match"] = result["player_name"].str.lower().str.strip()
+        result = result.merge(ppr_adp[["_match", "adp_rank"]], on="_match", how="left")
+        result.drop(columns=["_match"], inplace=True)
 
     # Merge years_of_experience from players for display in dashboard
     if not players.empty and "years_of_experience" in players.columns:

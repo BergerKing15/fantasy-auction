@@ -133,6 +133,7 @@ with tab_board:
     display_cols = {
         "player_name":           "Player",
         "position":              "Pos",
+        "adp_rank":              "ADP",
         "years_of_experience":   "Exp",
         "projected_fpts":        "Proj Pts",
         **(  {prev_col: f"{prev_col[5:]} Actual"} if prev_col else {}),
