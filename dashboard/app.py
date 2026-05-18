@@ -144,7 +144,7 @@ def render_player_panel(player_name: str, repriced: pd.DataFrame,
             def _style_bye(val):
                 return "color: #888; font-style: italic;" if val == "BYE" else ""
             st.dataframe(
-                sched.style.applymap(_style_bye, subset=["Opponent"]),
+                sched.style.map(_style_bye, subset=["Opponent"]),
                 use_container_width=True,
                 height=400,
                 hide_index=True,
