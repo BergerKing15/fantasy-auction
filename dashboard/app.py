@@ -11,6 +11,7 @@ import sys
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.express as px
 import plotly.graph_objects as go
 
@@ -241,6 +242,8 @@ if "projections" not in st.session_state:
     st.session_state.projections = None
 if "profile_player" not in st.session_state:
     st.session_state.profile_player = None
+if "nav_to_profile" not in st.session_state:
+    st.session_state.nav_to_profile = False
 
 # ─── Sidebar: Settings ────────────────────────────────────────────────────────
 
@@ -346,7 +349,8 @@ with tab_board:
         if col in show.columns:
             show[col] = show[col].round(1)
 
-    # Row selection: clicking a player auto-loads their profile below the table
+    st.caption("Click any player row to open their profile.")
+
     board_event = st.dataframe(
         show,
         use_container_width=True,
@@ -360,14 +364,12 @@ with tab_board:
         },
     )
 
-    # When a row is selected, update session state and render inline panel
     sel_rows = board_event.selection.rows
     if sel_rows:
         sel_name = show.iloc[sel_rows[0]]["Player"]
         st.session_state.profile_player = sel_name
-        render_player_panel(sel_name, repriced, schedule_df, ppr, STATS_PATH)
+        st.session_state.nav_to_profile = True
     else:
-        # Value chart when no player is selected
         if len(repriced) > 0:
             fig = px.bar(
                 repriced[repriced["position"].isin(pos_filter or ["QB","RB","WR","TE"])].head(60),
@@ -524,3 +526,26 @@ with tab_player:
         st.session_state.profile_player = selected
 
         render_player_panel(selected, repriced, schedule_df, ppr, STATS_PATH)
+
+# ─── Tab navigation: JS click ─────────────────────────────────────────────────
+# Runs OUTSIDE all tabs so the component always renders.
+# When a board row is selected, clicks the Player Profile tab (index 4) in the
+# parent document. Uses a retry loop in case the DOM hasn't settled yet.
+
+if st.session_state.get("nav_to_profile"):
+    st.session_state.nav_to_profile = False
+    components.html(
+        """
+        <script>
+        (function tryClick(attempts) {
+            var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
+            if (tabs && tabs.length > 4) {
+                tabs[4].click();
+            } else if (attempts > 0) {
+                setTimeout(function() { tryClick(attempts - 1); }, 80);
+            }
+        })(20);
+        </script>
+        """,
+        height=0,
+    )
