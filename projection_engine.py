@@ -338,6 +338,11 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
     print("Computing auction values...")
     result = compute_auction_values(projections)
 
+    # Merge years_of_experience from players for display in dashboard
+    if not players.empty and "years_of_experience" in players.columns:
+        yoe = players[["gsis_id", "years_of_experience"]].rename(columns={"gsis_id": "player_id"})
+        result = result.merge(yoe, on="player_id", how="left")
+
     # Attach prior-season actual fpts so the dashboard can show last year's performance
     prev_season = projection_season - 1
     prev = stats[stats["season"] == prev_season].copy()

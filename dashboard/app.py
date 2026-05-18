@@ -131,14 +131,15 @@ with tab_board:
     # Rename for display — detect whatever fpts_YYYY column exists
     prev_col = next((c for c in display.columns if c.startswith("fpts_")), None)
     display_cols = {
-        "player_name":    "Player",
-        "position":       "Pos",
-        "projected_fpts": "Proj Pts",
+        "player_name":           "Player",
+        "position":              "Pos",
+        "years_of_experience":   "Exp",
+        "projected_fpts":        "Proj Pts",
         **(  {prev_col: f"{prev_col[5:]} Actual"} if prev_col else {}),
-        "auction_value":  "Pre-Draft $",
-        "repriced_value": "Current $",
-        "ppg":            "Hist PPG",
-        "seasons":        "Seasons",
+        "auction_value":         "Pre-Draft $",
+        "repriced_value":        "Current $",
+        "ppg":                   "Recent PPG",
+        "seasons":               "Data Yrs",
     }
     show = display[[c for c in display_cols if c in display.columns]].rename(columns=display_cols)
     for col in ["Proj Pts", f"{prev_col[5:]} Actual" if prev_col else ""]:
