@@ -523,16 +523,18 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
                 result.loc[still_missing, "adp_rank"] = rank_fill2["adp_rank"].values
             result.drop(columns=["_match", "_match_bare"], errors="ignore", inplace=True)
 
-    # Merge years_of_experience from players for display in dashboard
-    if not players.empty and "years_of_experience" in players.columns:
-        yoe = players[["gsis_id", "years_of_experience"]].rename(columns={"gsis_id": "player_id"})
-        result = result.merge(yoe, on="player_id", how="left")
+    # Merge player metadata from players.csv for display in dashboard
+    if not players.empty:
+        player_extra_cols = [c for c in ["gsis_id", "years_of_experience", "headshot", "latest_team"] if c in players.columns]
+        if player_extra_cols:
+            extra = players[player_extra_cols].rename(columns={"gsis_id": "player_id", "headshot": "headshot_url"})
+            result = result.merge(extra, on="player_id", how="left")
 
-    # Merge DraftSharks metadata (DS proj, injury risk, SOS) for display in dashboard
+    # Merge DraftSharks metadata (DS proj, injury risk, SOS, team, bye) for display in dashboard
     if os.path.exists(adp_path):
         adp_meta = pd.read_csv(adp_path)
         if "ds_auction_value" in adp_meta.columns:  # DraftSharks format
-            meta_cols = [c for c in ["ds_proj", "consensus_proj", "injury_risk", "sos", "ds_auction_value"] if c in adp_meta.columns]
+            meta_cols = [c for c in ["ds_proj", "consensus_proj", "injury_risk", "sos", "ds_auction_value", "Team", "Bye"] if c in adp_meta.columns]
             if meta_cols:
                 adp_meta = adp_meta[adp_meta["scoring_format"] == "ppr"].copy()
                 adp_meta["_match"] = adp_meta["PlayerTeam (Bye)"].apply(_clean_adp_name)

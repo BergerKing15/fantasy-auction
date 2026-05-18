@@ -276,6 +276,23 @@ def fetch_all_adp() -> pd.DataFrame:
     return combined
 
 
+# ─── Schedule ─────────────────────────────────────────────────────────────────
+
+def fetch_schedule(season: int = 2026) -> pd.DataFrame:
+    """Download the regular-season NFL schedule and save to data/schedule.csv."""
+    print(f"Fetching {season} NFL schedule...")
+    try:
+        df = nfl.import_schedules([season])
+        df = df[df["game_type"] == "REG"][["week", "gameday", "away_team", "home_team"]].copy()
+        out = os.path.join(DATA_DIR, "schedule.csv")
+        df.to_csv(out, index=False)
+        print(f"  Saved {len(df):,} games -> {out}")
+        return df
+    except Exception as exc:
+        print(f"  Warning: could not fetch {season} schedule — {exc}")
+        return pd.DataFrame()
+
+
 # ─── DraftSharks ──────────────────────────────────────────────────────────────
 
 DS_BASE = "https://www.draftsharks.com"
@@ -390,6 +407,7 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     fetch_player_info()
     fetch_seasonal_stats()
+    fetch_schedule()
     # Prefer DraftSharks (richer data); fall back to FantasyPros on failure
     try:
         fetch_draftsharks_data()

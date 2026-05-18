@@ -14,11 +14,14 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Allow imports from parent directory when running from dashboard/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from projection_engine import run as run_projections, compute_fantasy_points
 from reprice_engine import AuctionState, DraftResult, reprice, position_market_summary
+
+# ─── Team abbreviation mapping ────────────────────────────────────────────────
+# DraftSharks uses LAR/JAC/LVR; nfl_data_py schedule uses LA/JAX/LV
+DS_TO_NFL = {"LAR": "LA", "JAC": "JAX", "LVR": "LV"}
 
 # ─── Cached Loaders ───────────────────────────────────────────────────────────
 
@@ -30,9 +33,197 @@ def load_projections_csv(path: str) -> pd.DataFrame:
 def load_seasonal_stats(path: str) -> pd.DataFrame:
     return pd.read_csv(path, low_memory=False)
 
+@st.cache_data
+def load_schedule(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
+
 @st.cache_data(show_spinner="Running projection engine...")
 def compute_projections(ppr: float, projection_season: int) -> pd.DataFrame:
     return run_projections(ppr=ppr, projection_season=projection_season)
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def player_photo(headshot_url, width: int = 130) -> None:
+    """Display player headshot via HTML img (browser-fetches the NFL CDN URL)."""
+    if pd.notna(headshot_url) and str(headshot_url).startswith("http"):
+        st.markdown(
+            f'<img src="{headshot_url}" width="{width}" '
+            f'style="border-radius:10px; object-fit:cover;">',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div style="width:{width}px;height:{width}px;border-radius:10px;'
+            f'background:#2a2a2a;display:flex;align-items:center;'
+            f'justify-content:center;font-size:40px;">🏈</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def get_team_schedule(player_row: pd.Series, schedule_df: pd.DataFrame) -> pd.DataFrame:
+    """Return the week-by-week schedule for the player's team, including bye."""
+    # latest_team is in nfl_data_py format (matches schedule); Team is DraftSharks
+    team = player_row.get("latest_team")
+    if pd.isna(team) or not str(team).strip():
+        ds = str(player_row.get("Team", "") or "")
+        team = DS_TO_NFL.get(ds, ds) or None
+
+    if not team or schedule_df.empty:
+        return pd.DataFrame()
+
+    mask = (schedule_df["home_team"] == team) | (schedule_df["away_team"] == team)
+    games = schedule_df[mask].copy()
+    if games.empty:
+        return pd.DataFrame()
+
+    games["Opponent"] = games.apply(
+        lambda r: r["away_team"] if r["home_team"] == team else r["home_team"], axis=1
+    )
+    games["H/A"] = games.apply(
+        lambda r: "Home" if r["home_team"] == team else "Away", axis=1
+    )
+    games = games.rename(columns={"week": "Wk", "gameday": "Date"})
+
+    # Detect and insert bye week
+    played_weeks = set(games["Wk"])
+    max_wk = int(games["Wk"].max())
+    for wk in range(1, max_wk + 2):
+        if wk not in played_weeks:
+            bye_row = pd.DataFrame([{"Wk": wk, "Date": "", "Opponent": "BYE", "H/A": "—"}])
+            games = pd.concat([games, bye_row], ignore_index=True)
+            break  # typically one bye week
+
+    return (
+        games[["Wk", "Date", "Opponent", "H/A"]]
+        .sort_values("Wk")
+        .reset_index(drop=True)
+    )
+
+
+def render_player_panel(player_name: str, repriced: pd.DataFrame,
+                        schedule_df: pd.DataFrame, ppr: float,
+                        stats_path: str) -> None:
+    """Render the full player detail panel (used in both board and profile tab)."""
+    matches = repriced[repriced["player_name"] == player_name]
+    if matches.empty:
+        return
+    row = matches.iloc[0]
+
+    st.divider()
+
+    # ── Header row: photo + key metrics ──────────────────────────────────────
+    ph_col, info_col = st.columns([1, 5])
+    with ph_col:
+        player_photo(row.get("headshot_url"), width=120)
+
+    with info_col:
+        team_label = (
+            str(row.get("latest_team") or row.get("Team") or "").strip() or "—"
+        )
+        pos = row.get("position", "")
+        st.subheader(f"{player_name}  —  {pos}  ·  {team_label}")
+
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("ADP",        f"#{int(row['adp_rank'])}" if pd.notna(row.get("adp_rank")) else "—")
+        m2.metric("Pre-Draft $", f"${row['auction_value']:.1f}")
+        m3.metric("Proj Pts",   f"{row['projected_fpts']:.0f}" if pd.notna(row.get("projected_fpts")) else "—")
+        m4.metric("DS Value",   f"${row['ds_auction_value']:.0f}" if pd.notna(row.get("ds_auction_value")) else "—")
+        m5.metric("Injury Risk", str(row.get("injury_risk") or "—"))
+        m6.metric("Bye Wk",     int(row["Bye"]) if pd.notna(row.get("Bye")) else "—")
+
+    # ── Bottom section: schedule | stats ─────────────────────────────────────
+    sched_col, hist_col = st.columns([1, 2])
+
+    with sched_col:
+        st.caption("**2026 Schedule**")
+        sched = get_team_schedule(row, schedule_df)
+        if sched.empty:
+            st.caption("Schedule unavailable.")
+        else:
+            # Highlight bye weeks
+            def _style_bye(val):
+                return "color: #888; font-style: italic;" if val == "BYE" else ""
+            st.dataframe(
+                sched.style.applymap(_style_bye, subset=["Opponent"]),
+                use_container_width=True,
+                height=400,
+                hide_index=True,
+            )
+
+    with hist_col:
+        st.caption("**Season History**")
+        if not os.path.exists(stats_path):
+            st.caption("Run webscraping.py to generate seasonal_stats.csv.")
+        else:
+            stats_df = load_seasonal_stats(stats_path)
+            pid = row["player_id"]
+            if str(pid).startswith("adp_"):
+                st.caption("No historical stats available (rookie).")
+            else:
+                player_stats = stats_df[stats_df["player_id"] == pid].sort_values("season").copy()
+                if player_stats.empty:
+                    st.caption("No historical stats found.")
+                else:
+                    player_stats["fpts"] = compute_fantasy_points(player_stats, ppr=ppr).round(1)
+                    player_stats["ppg"]  = (
+                        player_stats["fpts"] / player_stats["games"].clip(lower=1)
+                    ).round(2)
+
+                    # Chart
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=player_stats["season"].astype(str),
+                        y=player_stats["fpts"],
+                        name="Fpts",
+                        marker_color="steelblue",
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=player_stats["season"].astype(str),
+                        y=player_stats["ppg"],
+                        name="PPG",
+                        yaxis="y2",
+                        mode="lines+markers",
+                        line=dict(color="orange", width=2),
+                    ))
+                    fig.update_layout(
+                        yaxis=dict(title="Total Fpts"),
+                        yaxis2=dict(title="PPG", overlaying="y", side="right"),
+                        legend=dict(orientation="h"),
+                        margin=dict(t=10, b=10),
+                        height=220,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # Stat table
+                    pos = row.get("position", "")
+                    stat_map: dict[str, str] = {
+                        "season": "Season", "games": "G", "fpts": "Fpts", "ppg": "PPG"
+                    }
+                    if pos == "QB":
+                        stat_map.update({
+                            "completions": "Cmp", "attempts": "Att",
+                            "passing_yards": "Pass Yds", "passing_tds": "Pass TD",
+                            "interceptions": "INT", "rushing_yards": "Rush Yds",
+                        })
+                    elif pos == "RB":
+                        stat_map.update({
+                            "carries": "Car", "rushing_yards": "Rush Yds",
+                            "rushing_tds": "Rush TD", "receptions": "Rec",
+                            "receiving_yards": "Rec Yds", "receiving_tds": "Rec TD",
+                        })
+                    else:
+                        stat_map.update({
+                            "targets": "Tgt", "receptions": "Rec",
+                            "receiving_yards": "Rec Yds", "receiving_tds": "Rec TD",
+                            "rushing_yards": "Rush Yds",
+                        })
+                    visible = [c for c in stat_map if c in player_stats.columns]
+                    tbl = player_stats[visible].rename(columns=stat_map)
+                    for c in tbl.select_dtypes(include="number").columns:
+                        if c not in ("PPG",):
+                            tbl[c] = tbl[c].round(0).astype("Int64", errors="ignore")
+                    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 
@@ -46,9 +237,10 @@ st.set_page_config(
 
 if "auction_state" not in st.session_state:
     st.session_state.auction_state = AuctionState(teams=12, budget=200.0)
-
 if "projections" not in st.session_state:
     st.session_state.projections = None
+if "profile_player" not in st.session_state:
+    st.session_state.profile_player = None
 
 # ─── Sidebar: Settings ────────────────────────────────────────────────────────
 
@@ -63,14 +255,13 @@ ppr = st.sidebar.select_slider(
 
 num_teams = st.sidebar.number_input("Teams in League", min_value=8, max_value=16, value=12)
 budget    = st.sidebar.number_input("Budget per Team ($)", min_value=50, max_value=500, value=200)
-
 st.sidebar.divider()
-
 proj_season = st.sidebar.number_input("Projection Season", min_value=2020, max_value=2030, value=2026)
 
 DATA_DIR         = os.path.join(os.path.dirname(__file__), "..")
 PROJECTIONS_PATH = os.path.join(DATA_DIR, "data", "projections.csv")
 STATS_PATH       = os.path.join(DATA_DIR, "data", "seasonal_stats.csv")
+SCHEDULE_PATH    = os.path.join(DATA_DIR, "data", "schedule.csv")
 
 if st.sidebar.button("🔄 Load / Refresh Projections"):
     if os.path.exists(PROJECTIONS_PATH):
@@ -94,8 +285,8 @@ if st.session_state.projections is None and os.path.exists(PROJECTIONS_PATH):
 projections = st.session_state.projections
 state       = st.session_state.auction_state
 
-# Reprice once per render and share across tabs
-repriced = reprice(projections, state) if projections is not None else None
+repriced     = reprice(projections, state) if projections is not None else None
+schedule_df  = load_schedule(SCHEDULE_PATH) if os.path.exists(SCHEDULE_PATH) else pd.DataFrame()
 
 # ─── Main Tabs ────────────────────────────────────────────────────────────────
 
@@ -116,7 +307,6 @@ with tab_board:
         st.info("Click **Load / Refresh Projections** in the sidebar to get started.")
         st.stop()
 
-    # Filters
     col1, col2, col3 = st.columns(3)
     with col1:
         pos_filter = st.multiselect(
@@ -134,7 +324,6 @@ with tab_board:
         display = display[display["position"].isin(pos_filter)]
     display = display[display["repriced_value"] <= max_price]
 
-    # Rename for display — detect whatever fpts_YYYY column exists
     prev_col = next((c for c in display.columns if c.startswith("fpts_")), None)
     display_cols = {
         "player_name":           "Player",
@@ -148,31 +337,46 @@ with tab_board:
         "ppg":                   "Recent PPG",
         "seasons":               "Data Yrs",
     }
-    show = display[[c for c in display_cols if c in display.columns]].rename(columns=display_cols)
+    show = (
+        display[[c for c in display_cols if c in display.columns]]
+        .rename(columns=display_cols)
+        .reset_index(drop=True)    # positional index must match st.dataframe row numbers
+    )
     for col in ["Proj Pts", f"{prev_col[5:]} Actual" if prev_col else ""]:
         if col in show.columns:
             show[col] = show[col].round(1)
 
-    st.dataframe(
+    # Row selection: clicking a player auto-loads their profile below the table
+    board_event = st.dataframe(
         show,
         use_container_width=True,
-        height=600,
+        height=500,
+        on_select="rerun",
+        selection_mode="single-row",
         column_config={
-            "Current $":  st.column_config.NumberColumn(format="$%.1f"),
+            "Current $":   st.column_config.NumberColumn(format="$%.1f"),
             "Pre-Draft $": st.column_config.NumberColumn(format="$%.1f"),
+            "Player":      st.column_config.TextColumn("Player"),
         },
     )
 
-    # Value distribution chart
-    if len(repriced) > 0:
-        fig = px.bar(
-            repriced[repriced["position"].isin(pos_filter or ["QB","RB","WR","TE"])].head(60),
-            x="player_name", y="repriced_value", color="position",
-            title="Top Players by Current Auction Value",
-            labels={"repriced_value": "Auction Value ($)", "player_name": ""},
-        )
-        fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+    # When a row is selected, update session state and render inline panel
+    sel_rows = board_event.selection.rows
+    if sel_rows:
+        sel_name = show.iloc[sel_rows[0]]["Player"]
+        st.session_state.profile_player = sel_name
+        render_player_panel(sel_name, repriced, schedule_df, ppr, STATS_PATH)
+    else:
+        # Value chart when no player is selected
+        if len(repriced) > 0:
+            fig = px.bar(
+                repriced[repriced["position"].isin(pos_filter or ["QB","RB","WR","TE"])].head(60),
+                x="player_name", y="repriced_value", color="position",
+                title="Top Players by Current Auction Value",
+                labels={"repriced_value": "Auction Value ($)", "player_name": ""},
+            )
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
 
 # ─── Tab 2: Live Draft Input ──────────────────────────────────────────────────
 
@@ -209,7 +413,6 @@ with tab_live:
                 state.record_pick(pick)
                 st.success(f"Recorded: {selected_player} -> {winning_team} for ${price_paid}")
 
-        # Position market summary
         st.subheader("Position Market Trends")
         mkt = position_market_summary(state)
         if mkt.empty:
@@ -240,23 +443,22 @@ with tab_teams:
             picks = state.team_rosters.get(team, [])
             spent = sum(p.actual_price for p in picks)
             team_data.append({
-                "Team":         team,
-                "Spent ($)":    spent,
+                "Team":          team,
+                "Spent ($)":     spent,
                 "Remaining ($)": remaining,
-                "Picks":        len(picks),
+                "Picks":         len(picks),
             })
         st.dataframe(pd.DataFrame(team_data), use_container_width=True)
 
-        # Team breakdown expander
         for team, picks in state.team_rosters.items():
             with st.expander(f"{team} — {len(picks)} picks"):
                 pick_rows = [
                     {
-                        "Player": p.player_name,
-                        "Pos": p.position,
-                        "Price ($)": p.actual_price,
-                        "Projected ($)": p.projected_value,
-                        "Value": round(p.actual_price / max(p.projected_value, 1), 2),
+                        "Player":         p.player_name,
+                        "Pos":            p.position,
+                        "Price ($)":      p.actual_price,
+                        "Projected ($)":  p.projected_value,
+                        "Value":          round(p.actual_price / max(p.projected_value, 1), 2),
                     }
                     for p in picks
                 ]
@@ -306,132 +508,19 @@ with tab_player:
     if repriced is None:
         st.info("Load projections first (sidebar).")
     else:
-        # Player selector
         skill = repriced[repriced["position"].isin(["QB", "RB", "WR", "TE"])].copy()
-        skill_sorted = skill.sort_values("auction_value", ascending=False)
-        player_names = skill_sorted["player_name"].tolist()
+        player_names = skill.sort_values("auction_value", ascending=False)["player_name"].tolist()
 
-        selected = st.selectbox("Search / select a player", options=player_names)
-        if not selected:
-            st.stop()
+        # Default to whatever was clicked in the board (if anything)
+        default_name = st.session_state.get("profile_player") or player_names[0]
+        default_idx  = player_names.index(default_name) if default_name in player_names else 0
 
-        row = skill[skill["player_name"] == selected].iloc[0]
+        selected = st.selectbox(
+            "Search / select a player",
+            options=player_names,
+            index=default_idx,
+        )
+        # Keep session state in sync with manual selectbox changes
+        st.session_state.profile_player = selected
 
-        # ── Header ──────────────────────────────────────────────────────────
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Position",  row["position"])
-        c2.metric("ADP Rank",  int(row["adp_rank"]) if pd.notna(row.get("adp_rank")) else "N/A")
-        c3.metric("Pre-Draft $", f"${row['auction_value']:.1f}")
-        c4.metric("Proj Pts",  f"{row['projected_fpts']:.0f}" if pd.notna(row.get("projected_fpts")) else "N/A")
-        age_val = row.get("age")
-        c5.metric("Age",       f"{age_val:.0f}" if pd.notna(age_val) else "N/A")
-
-        st.divider()
-
-        col_left, col_right = st.columns([1, 2])
-
-        # ── Left panel: snapshot ────────────────────────────────────────────
-        with col_left:
-            st.subheader("Valuation Breakdown")
-            val_data = {
-                "Component":   ["PAR Value", "DS Auction Value", "Final Blended ($)"],
-                "Value ($)":   [
-                    round(float(row.get("auction_value", 0)), 1),   # pre-blend = auction_value
-                    round(float(row["ds_auction_value"]), 1) if pd.notna(row.get("ds_auction_value")) else None,
-                    round(float(row["auction_value"]), 1),
-                ],
-            }
-            st.dataframe(pd.DataFrame(val_data), use_container_width=True, hide_index=True)
-
-            # DraftSharks metadata panel
-            ds_fields = {
-                "DS Proj Pts":    row.get("ds_proj"),
-                "Consensus Proj": row.get("consensus_proj"),
-                "Injury Risk":    row.get("injury_risk"),
-                "SOS":            row.get("sos"),
-                "Data Seasons":   row.get("seasons"),
-                "Recent PPG":     f"{row['ppg']:.2f}" if pd.notna(row.get("ppg")) else None,
-                "Experience":     row.get("years_of_experience"),
-            }
-            st.subheader("DraftSharks Data")
-            ds_rows = [{"Field": k, "Value": v} for k, v in ds_fields.items() if pd.notna(v) and v is not None]
-            if ds_rows:
-                st.dataframe(pd.DataFrame(ds_rows), use_container_width=True, hide_index=True)
-            else:
-                st.caption("No DraftSharks data — refresh projections after running webscraping.py")
-
-        # ── Right panel: season history ──────────────────────────────────────
-        with col_right:
-            st.subheader("Season History")
-
-            if not os.path.exists(STATS_PATH):
-                st.caption("seasonal_stats.csv not found — run webscraping.py to generate it.")
-            else:
-                stats_df = load_seasonal_stats(STATS_PATH)
-                pid = row["player_id"]
-                # rookies have synthetic IDs like "adp_jeremiyah_love"
-                if str(pid).startswith("adp_"):
-                    player_stats = pd.DataFrame()
-                else:
-                    player_stats = stats_df[stats_df["player_id"] == pid].copy()
-
-                if player_stats.empty:
-                    st.caption("No historical stats available (rookie or new player).")
-                else:
-                    player_stats = player_stats.sort_values("season")
-                    player_stats["fpts"] = compute_fantasy_points(player_stats, ppr=ppr).round(1)
-                    player_stats["ppg"]  = (player_stats["fpts"] / player_stats["games"].clip(lower=1)).round(2)
-
-                    # Fantasy points trend chart
-                    fig_hist = go.Figure()
-                    fig_hist.add_trace(go.Bar(
-                        x=player_stats["season"].astype(str),
-                        y=player_stats["fpts"],
-                        name="Total Fpts",
-                        marker_color="steelblue",
-                    ))
-                    fig_hist.add_trace(go.Scatter(
-                        x=player_stats["season"].astype(str),
-                        y=player_stats["ppg"],
-                        name="PPG",
-                        yaxis="y2",
-                        mode="lines+markers",
-                        line=dict(color="orange", width=2),
-                    ))
-                    fig_hist.update_layout(
-                        title=f"{selected} — Fantasy Points by Season (PPR={ppr})",
-                        yaxis=dict(title="Total Fantasy Pts"),
-                        yaxis2=dict(title="PPG", overlaying="y", side="right"),
-                        legend=dict(orientation="h"),
-                        height=300,
-                    )
-                    st.plotly_chart(fig_hist, use_container_width=True)
-
-                    # Position-specific stat columns to show
-                    pos = row["position"]
-                    stat_cols: dict[str, str] = {"season": "Season", "games": "G", "fpts": "Fpts", "ppg": "PPG"}
-                    if pos == "QB":
-                        stat_cols.update({
-                            "completions": "Cmp", "attempts": "Att",
-                            "passing_yards": "Pass Yds", "passing_tds": "Pass TD",
-                            "interceptions": "INT", "rushing_yards": "Rush Yds",
-                        })
-                    elif pos == "RB":
-                        stat_cols.update({
-                            "carries": "Car", "rushing_yards": "Rush Yds",
-                            "rushing_tds": "Rush TD", "receptions": "Rec",
-                            "receiving_yards": "Rec Yds", "receiving_tds": "Rec TD",
-                        })
-                    else:  # WR / TE
-                        stat_cols.update({
-                            "targets": "Tgt", "receptions": "Rec",
-                            "receiving_yards": "Rec Yds", "receiving_tds": "Rec TD",
-                            "rushing_yards": "Rush Yds",
-                        })
-
-                    visible = [c for c in stat_cols if c in player_stats.columns]
-                    hist_table = player_stats[visible].rename(columns=stat_cols)
-                    # Round numeric columns
-                    for c in hist_table.select_dtypes(include="number").columns:
-                        hist_table[c] = hist_table[c].round(0).astype("Int64", errors="ignore")
-                    st.dataframe(hist_table, use_container_width=True, hide_index=True)
+        render_player_panel(selected, repriced, schedule_df, ppr, STATS_PATH)
