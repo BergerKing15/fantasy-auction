@@ -317,6 +317,15 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
     print("Computing auction values...")
     result = compute_auction_values(projections)
 
+    # Attach prior-season actual fpts so the dashboard can show last year's performance
+    prev_season = projection_season - 1
+    prev = stats[stats["season"] == prev_season].copy()
+    if len(prev) > 0:
+        prev["fpts_prev"] = compute_fantasy_points(prev, ppr=ppr)
+        prev_totals = prev.groupby("player_id")["fpts_prev"].sum().reset_index()
+        prev_totals.columns = ["player_id", f"fpts_{prev_season}"]
+        result = result.merge(prev_totals, on="player_id", how="left")
+
     try:
         out = os.path.join(DATA_DIR, "projections.csv")
         result.to_csv(out, index=False)
