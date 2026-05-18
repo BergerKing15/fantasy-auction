@@ -26,6 +26,7 @@ ADP_URLS = {
     "std":  "https://www.fantasypros.com/nfl/adp/overall.php",
     "half": "https://www.fantasypros.com/nfl/adp/half-point-ppr-overall.php",
     "ppr":  "https://www.fantasypros.com/nfl/adp/ppr-overall.php",
+    "dst":  "https://www.fantasypros.com/nfl/adp/dst.php",
 }
 
 HEADERS = {
@@ -202,7 +203,7 @@ def fetch_player_info() -> pd.DataFrame:
     """Download player metadata: name, position, DOB, draft details, etc."""
     print("Fetching player info...")
     df = nfl.import_players()
-    df = df[df["position"].isin(["QB", "RB", "WR", "TE"])].copy()
+    df = df[df["position"].isin(["QB", "RB", "WR", "TE", "K"])].copy()
 
     out = os.path.join(DATA_DIR, "players.csv")
     df.to_csv(out, index=False)
@@ -253,10 +254,10 @@ def fetch_adp(scoring: str = "ppr") -> pd.DataFrame:
 
 
 def fetch_all_adp() -> pd.DataFrame:
-    """Fetch ADP for all three scoring formats and combine into one CSV."""
+    """Fetch ADP for all scoring formats (skill + K + DST) and combine into one CSV."""
     print("Fetching ADP data...")
     frames = []
-    for scoring in ["std", "half", "ppr"]:
+    for scoring in ["std", "half", "ppr", "dst"]:
         try:
             frames.append(fetch_adp(scoring))
         except Exception as exc:

@@ -56,6 +56,10 @@ BENCH_DEPTH = {"QB": 1.5, "RB": 2.5, "WR": 2.5, "TE": 1.5}
 # How many seasons of history to weight together for the empirical estimate
 SEASONS_USED = 3
 
+# Recency weights: most recent season (lag=0) counts fully; older seasons are discounted.
+# This prevents a 4-game injury year from being averaged equally with a healthy full season.
+RECENCY_WEIGHTS = {0: 1.0, 1: 0.7, 2: 0.4}
+
 # Bayesian shrinkage constant: player needs this many game-seasons to be
 # weighted equally against the position prior (16 ≈ one full season)
 SHRINKAGE_K = 16.0
@@ -175,16 +179,33 @@ def project_players(
     train = stats[stats["season"].isin(train_seasons)].copy()
     train["fpts"] = compute_fantasy_points(train, ppr=ppr)
     train["games"] = train.get("games", pd.Series(17, index=train.index)).fillna(1).clip(lower=1)
-    train["ppg"] = train["fpts"] / train["games"]
 
-    # Aggregate over the training window — vectorized, no row-by-row apply
-    agg_cols = {"total_fpts": ("fpts", "sum"), "total_games": ("games", "sum"),
-                "seasons": ("season", "nunique"), "position": ("position", "first")}
+    # Recency weighting: multiply each game's contribution by a per-season weight.
+    # This means a recent full season dominates over an old injury-shortened one.
+    # e.g. CMC 2024 (4 injury games, weight 0.7) = 2.8 effective games vs
+    #      CMC 2025 (17 games, weight 1.0) = 17.0 effective games — correct.
+    max_season = train["season"].max()
+    train["season_lag"] = (max_season - train["season"]).astype(int)
+    oldest_weight = RECENCY_WEIGHTS[max(RECENCY_WEIGHTS)]
+    train["season_weight"] = train["season_lag"].map(RECENCY_WEIGHTS).fillna(oldest_weight)
+    train["w_fpts"]  = train["fpts"]  * train["season_weight"]
+    train["w_games"] = train["games"] * train["season_weight"]
+
+    agg_cols = {
+        "total_fpts":  ("fpts",          "sum"),
+        "total_games": ("games",         "sum"),
+        "w_fpts":      ("w_fpts",        "sum"),
+        "w_games":     ("w_games",       "sum"),
+        "seasons":     ("season",        "nunique"),
+        "position":    ("position",      "first"),
+    }
     if "player_name" in train.columns:
-        agg_cols["player_name"] = ("player_name", "first")
+        agg_cols["player_name"] = ("player_name", "last")  # last = most recent season's name
 
     player_history = train.groupby("player_id").agg(**agg_cols).reset_index()
-    player_history["ppg"] = player_history["total_fpts"] / player_history["total_games"].clip(lower=1)
+    # Weighted PPG: recency-weighted fpts / recency-weighted games
+    player_history["ppg"] = player_history["w_fpts"] / player_history["w_games"].clip(lower=0.01)
+    player_history.drop(columns=["w_fpts", "w_games"], inplace=True)
 
     if age_lookup is not None:
         player_history = player_history.merge(age_lookup[["player_id", "age"]], on="player_id", how="left")
@@ -325,6 +346,39 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
         prev_totals = prev.groupby("player_id")["fpts_prev"].sum().reset_index()
         prev_totals.columns = ["player_id", f"fpts_{prev_season}"]
         result = result.merge(prev_totals, on="player_id", how="left")
+
+    # Add K and DST rows — not projected via PAR, all valued at $1
+    kd_rows = []
+
+    # Kickers: from players.csv (position == "K"), filter to recently active
+    if not players.empty and "position" in players.columns:
+        k_all = players[players["position"] == "K"].copy()
+        if "last_season" in k_all.columns:
+            k_all = k_all[k_all["last_season"] >= 2024]
+        k_players = k_all[["gsis_id", "display_name"]].copy()
+        k_players.columns = ["player_id", "player_name"]
+        k_players["position"] = "K"
+        kd_rows.append(k_players)
+
+    # DST: from adp.csv
+    adp_path = os.path.join(DATA_DIR, "adp.csv")
+    if os.path.exists(adp_path):
+        adp = pd.read_csv(adp_path)
+        dst = adp[adp["scoring_format"] == "dst"].copy()
+        if dst.empty:
+            dst = adp[adp["POS"].str.startswith("D", na=False)].drop_duplicates("PlayerTeam (Bye)")
+        dst["player_name"] = dst["PlayerTeam (Bye)"].str.replace(r"\(.*\)", "", regex=True).str.strip()
+        dst["position"] = "DST"
+        dst["player_id"] = "dst_" + dst["player_name"].str.lower().str.replace(" ", "_")
+        kd_rows.append(dst[["player_id", "player_name", "position"]])
+
+    if kd_rows:
+        kd = pd.concat(kd_rows, ignore_index=True)
+        kd["auction_value"]   = 1.0
+        kd["projected_fpts"]  = 0.0
+        kd["par"]             = 0.0
+        kd["replacement_pts"] = 0.0
+        result = pd.concat([result, kd], ignore_index=True)
 
     try:
         out = os.path.join(DATA_DIR, "projections.csv")
