@@ -20,7 +20,7 @@ except ImportError:
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 DATA_DIR = "data"
-STAT_YEARS = list(range(2014, 2025))   # 2014 through 2024 (latest nflverse release)
+STAT_YEARS = list(range(2014, 2026))   # 2014 through 2025
 
 ADP_URLS = {
     "std":  "https://www.fantasypros.com/nfl/adp/overall.php",
@@ -38,26 +38,156 @@ HEADERS = {
 
 # ─── Stats ────────────────────────────────────────────────────────────────────
 
-def fetch_seasonal_stats(years: list[int] = STAT_YEARS) -> pd.DataFrame:
-    """Download seasonal player stats for the given years via nfl_data_py.
+def _seasonal_from_pbp(year: int) -> pd.DataFrame:
+    """
+    Aggregate seasonal stats from play-by-play for a single year.
+    Used as a fallback when nflverse hasn't published the pre-aggregated file yet.
+    """
+    print(f"    {year}: seasonal file not yet published — aggregating from play-by-play...")
+    cols = [
+        "game_id", "season", "season_type",
+        "passer_player_id", "pass_attempt", "complete_pass",
+        "passing_yards", "pass_touchdown", "interception", "sack",
+        "rusher_player_id", "rush_attempt", "rushing_yards", "rush_touchdown",
+        "receiver_player_id", "receiving_yards",
+        "fumbled_1_player_id", "fumble_lost",
+    ]
+    pbp = nfl.import_pbp_data([year], columns=cols)
+    pbp = pbp[pbp["season_type"] == "REG"].copy()
 
-    Seasonal data has no position column, so we merge it from the players file.
+    # ── Passing ──────────────────────────────────────────────────────────────
+    pass_plays = pbp[pbp["passer_player_id"].notna() & (pbp["pass_attempt"] == 1)]
+    passing = (
+        pass_plays.groupby("passer_player_id")
+        .agg(
+            completions=("complete_pass", "sum"),
+            attempts=("pass_attempt", "sum"),
+            passing_yards=("passing_yards", "sum"),
+            passing_tds=("pass_touchdown", "sum"),
+            interceptions=("interception", "sum"),
+            sacks=("sack", "sum"),
+            games_p=("game_id", "nunique"),
+        )
+        .reset_index()
+        .rename(columns={"passer_player_id": "player_id"})
+    )
+    sack_fum = (
+        pbp[(pbp["sack"] == 1) & (pbp["fumble_lost"] == 1) &
+            (pbp["fumbled_1_player_id"] == pbp["passer_player_id"])]
+        .groupby("passer_player_id").size()
+        .reset_index(name="sack_fumbles_lost")
+        .rename(columns={"passer_player_id": "player_id"})
+    )
+    passing = passing.merge(sack_fum, on="player_id", how="left")
+
+    # ── Rushing ──────────────────────────────────────────────────────────────
+    rush_plays = pbp[pbp["rusher_player_id"].notna() & (pbp["rush_attempt"] == 1)]
+    rushing = (
+        rush_plays.groupby("rusher_player_id")
+        .agg(
+            carries=("rush_attempt", "sum"),
+            rushing_yards=("rushing_yards", "sum"),
+            rushing_tds=("rush_touchdown", "sum"),
+            games_r=("game_id", "nunique"),
+        )
+        .reset_index()
+        .rename(columns={"rusher_player_id": "player_id"})
+    )
+    rush_fum = (
+        pbp[(pbp["rush_attempt"] == 1) & (pbp["fumble_lost"] == 1) &
+            (pbp["fumbled_1_player_id"] == pbp["rusher_player_id"])]
+        .groupby("rusher_player_id").size()
+        .reset_index(name="rushing_fumbles_lost")
+        .rename(columns={"rusher_player_id": "player_id"})
+    )
+    rushing = rushing.merge(rush_fum, on="player_id", how="left")
+
+    # ── Receiving ─────────────────────────────────────────────────────────────
+    rec_plays = pbp[pbp["receiver_player_id"].notna() & (pbp["pass_attempt"] == 1)]
+    receiving = (
+        rec_plays.groupby("receiver_player_id")
+        .agg(
+            targets=("pass_attempt", "sum"),
+            receptions=("complete_pass", "sum"),
+            receiving_yards=("receiving_yards", "sum"),
+            receiving_tds=("pass_touchdown", "sum"),
+            games_rec=("game_id", "nunique"),
+        )
+        .reset_index()
+        .rename(columns={"receiver_player_id": "player_id"})
+    )
+    rec_fum = (
+        pbp[(pbp["complete_pass"] == 1) & (pbp["fumble_lost"] == 1) &
+            (pbp["fumbled_1_player_id"] == pbp["receiver_player_id"])]
+        .groupby("receiver_player_id").size()
+        .reset_index(name="receiving_fumbles_lost")
+        .rename(columns={"receiver_player_id": "player_id"})
+    )
+    receiving = receiving.merge(rec_fum, on="player_id", how="left")
+
+    # ── Merge all three ───────────────────────────────────────────────────────
+    all_ids = (
+        set(passing["player_id"]) |
+        set(rushing["player_id"]) |
+        set(receiving["player_id"])
+    )
+    df = (
+        pd.DataFrame({"player_id": list(all_ids)})
+        .merge(passing, on="player_id", how="left")
+        .merge(rushing, on="player_id", how="left")
+        .merge(receiving, on="player_id", how="left")
+    )
+
+    num_cols = [
+        "completions", "attempts", "passing_yards", "passing_tds", "interceptions",
+        "sacks", "sack_fumbles_lost",
+        "carries", "rushing_yards", "rushing_tds", "rushing_fumbles_lost",
+        "targets", "receptions", "receiving_yards", "receiving_tds", "receiving_fumbles_lost",
+    ]
+    df[num_cols] = df[num_cols].fillna(0)
+    df["games"] = df[["games_p", "games_r", "games_rec"]].max(axis=1).fillna(0)
+    df = df.drop(columns=["games_p", "games_r", "games_rec"])
+    df["season"] = year
+    return df
+
+
+def fetch_seasonal_stats(years: list[int] = STAT_YEARS) -> pd.DataFrame:
+    """Download seasonal player stats for the given years.
+
+    Uses nfl_data_py import_seasonal_data where available; falls back to
+    play-by-play aggregation for years where the pre-aggregated file hasn't
+    been published yet (e.g. the most recent completed season).
+
+    Seasonal data has no position column, so we merge it from players.csv.
     player_id (seasonal) maps to gsis_id (players).
     """
     print(f"Fetching seasonal stats ({years[0]}-{years[-1]})...")
-    df = nfl.import_seasonal_data(years, s_type="REG")
 
-    # Merge in position and display_name from players data
+    frames = []
+    # Collect years that work with import_seasonal_data vs those that need PBP
+    standard_years, pbp_years = [], []
+    for y in years:
+        try:
+            nfl.import_seasonal_data([y], s_type="REG")
+            standard_years.append(y)
+        except Exception:
+            pbp_years.append(y)
+
+    if standard_years:
+        frames.append(nfl.import_seasonal_data(standard_years, s_type="REG"))
+    for y in pbp_years:
+        frames.append(_seasonal_from_pbp(y))
+
+    df = pd.concat(frames, ignore_index=True)
+
+    # Merge in position and player_name from players.csv
     players_path = os.path.join(DATA_DIR, "players.csv")
     if os.path.exists(players_path):
         players = pd.read_csv(players_path, usecols=["gsis_id", "position", "display_name"])
-        df = df.merge(players.rename(columns={"gsis_id": "player_id"}), on="player_id", how="left")
     else:
-        # Fall back: fetch inline (slower but self-contained)
         players = nfl.import_players()[["gsis_id", "position", "display_name"]]
-        df = df.merge(players.rename(columns={"gsis_id": "player_id"}), on="player_id", how="left")
+    df = df.merge(players.rename(columns={"gsis_id": "player_id"}), on="player_id", how="left")
 
-    # Keep only skill positions
     df = df[df["position"].isin(["QB", "RB", "WR", "TE"])].copy()
     df = df.rename(columns={"display_name": "player_name"})
     df.reset_index(drop=True, inplace=True)

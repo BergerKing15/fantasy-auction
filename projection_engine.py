@@ -8,10 +8,8 @@ Outputs: data/projections.csv
 """
 
 import os
-import sys
 import pandas as pd
 import numpy as np
-from typing import Literal
 
 # ─── Scoring Settings ─────────────────────────────────────────────────────────
 
@@ -41,11 +39,19 @@ LEAGUE = {
         "K":    1,
         "DST":  1,
     },
+    "bench": 6,   # midpoint of 5-8 bench spots
+    "IR":    1,
     "min_bid": 1,
 }
 
 # Approximate fraction of FLEX slots filled by each position (rough historical average)
 FLEX_SPLIT = {"RB": 0.40, "WR": 0.50, "TE": 0.10}
+
+# How many players of each position teams typically roster including bench.
+# Lowering replacement level to include bench depth is what keeps values realistic —
+# only ~80 players have PAR if you use starter counts alone, concentrating all
+# dollars at the top. Bench depth spreads the pool to ~150 players.
+BENCH_DEPTH = {"QB": 1.5, "RB": 2.5, "WR": 2.5, "TE": 1.5}
 
 # How many seasons of history to weight together for the empirical estimate
 SEASONS_USED = 3
@@ -109,19 +115,14 @@ def compute_position_priors(
     df["games"] = df.get("games", pd.Series(17, index=df.index)).fillna(1).clip(lower=1)
     df["ppg"] = df["fpts"] / df["games"]
 
-    # Age brackets: rookie (<=23), young (24-27), prime (28-30), veteran (31+)
-    def age_bracket(age):
-        if pd.isna(age) or age <= 23:
-            return "rookie"
-        elif age <= 27:
-            return "young"
-        elif age <= 30:
-            return "prime"
-        else:
-            return "veteran"
-
+    # Age brackets vectorized (no row-by-row apply)
     if "age" in df.columns:
-        df["age_bracket"] = df["age"].apply(age_bracket)
+        a = df["age"]
+        df["age_bracket"] = np.select(
+            [a.isna() | (a <= 23), a <= 27, a <= 30],
+            ["rookie",              "young",  "prime"],
+            default="veteran",
+        )
     else:
         df["age_bracket"] = "unknown"
 
@@ -131,31 +132,6 @@ def compute_position_priors(
         .to_dict()
     )
     return priors
-
-
-def lookup_prior(position: str, age: float | None, priors: dict) -> float:
-    """Return prior ppg for a player given their position and age."""
-    def bracket(a):
-        if a is None or np.isnan(a):
-            return "rookie"
-        elif a <= 23:
-            return "rookie"
-        elif a <= 27:
-            return "young"
-        elif a <= 30:
-            return "prime"
-        else:
-            return "veteran"
-
-    key = (position, bracket(age))
-    if key in priors:
-        return priors[key]
-    # Fallback: any bracket for this position
-    for br in ["young", "prime", "rookie", "veteran", "unknown"]:
-        fallback = (position, br)
-        if fallback in priors:
-            return priors[fallback]
-    return 0.0
 
 
 # ─── Projections ──────────────────────────────────────────────────────────────
@@ -174,74 +150,76 @@ def project_players(
     Uses SEASONS_USED most recent seasons (before projection_season) as
     the empirical estimate, Bayesian-shrunk toward position × age priors.
     """
-    # Cap at 2024 — nflverse hasn't published 2025 data yet
-    max_available = 2024
+    # Cap at most recent season with data (2025 fetched via PBP fallback in webscraping.py)
+    max_available = 2025
     train_seasons = [y for y in range(projection_season - seasons_used, projection_season) if y <= max_available]
     prior_seasons = [y for y in range(projection_season - 8, projection_season) if y <= max_available]
 
-    priors = compute_position_priors(stats, ppr=ppr, train_seasons=prior_seasons)
+    # Build age lookup once — reused for both prior computation and player history.
+    # seasonal_stats.csv has no age column; it lives in players.csv.
+    if "player_id" in players.columns and "birth_date" in players.columns:
+        age_lookup = players[["player_id", "birth_date"]].copy()
+        age_lookup["birth_date"] = pd.to_datetime(age_lookup["birth_date"], errors="coerce")
+        age_lookup["age"] = (
+            pd.Timestamp(f"{projection_season}-09-01") - age_lookup["birth_date"]
+        ).dt.days / 365.25
+    else:
+        age_lookup = None
+
+    stats_with_age = (
+        stats.merge(age_lookup[["player_id", "age"]], on="player_id", how="left")
+        if age_lookup is not None else stats
+    )
+    priors = compute_position_priors(stats_with_age, ppr=ppr, train_seasons=prior_seasons)
 
     train = stats[stats["season"].isin(train_seasons)].copy()
     train["fpts"] = compute_fantasy_points(train, ppr=ppr)
     train["games"] = train.get("games", pd.Series(17, index=train.index)).fillna(1).clip(lower=1)
     train["ppg"] = train["fpts"] / train["games"]
 
-    # Aggregate over the training window: weighted by games played
-    player_history = (
-        train.groupby("player_id")
-        .apply(
-            lambda g: pd.Series({
-                "total_fpts":  g["fpts"].sum(),
-                "total_games": g["games"].sum(),
-                "seasons":     g["season"].nunique(),
-                "last_season_fpts": g.loc[g["season"].idxmax(), "fpts"] if len(g) > 0 else 0,
-                "ppg":         g["fpts"].sum() / max(g["games"].sum(), 1),
-                "position":    g["position"].iloc[0],
-                "player_name": g["player_name"].iloc[0] if "player_name" in g.columns else "",
-            }),
-            include_groups=False,
-        )
-        .reset_index()
-    )
+    # Aggregate over the training window — vectorized, no row-by-row apply
+    agg_cols = {"total_fpts": ("fpts", "sum"), "total_games": ("games", "sum"),
+                "seasons": ("season", "nunique"), "position": ("position", "first")}
+    if "player_name" in train.columns:
+        agg_cols["player_name"] = ("player_name", "first")
 
-    # Merge player metadata for age
-    if "player_id" in players.columns and "birth_date" in players.columns:
-        players_clean = players[["player_id", "birth_date", "display_name"]].copy()
-        players_clean["birth_date"] = pd.to_datetime(players_clean["birth_date"], errors="coerce")
-        players_clean["age"] = (
-            pd.Timestamp(f"{projection_season}-09-01") - players_clean["birth_date"]
-        ).dt.days / 365.25
-        player_history = player_history.merge(
-            players_clean[["player_id", "age", "display_name"]], on="player_id", how="left"
-        )
+    player_history = train.groupby("player_id").agg(**agg_cols).reset_index()
+    player_history["ppg"] = player_history["total_fpts"] / player_history["total_games"].clip(lower=1)
+
+    if age_lookup is not None:
+        player_history = player_history.merge(age_lookup[["player_id", "age"]], on="player_id", how="left")
     else:
         player_history["age"] = None
 
-    # Bayesian shrinkage: posterior = w * empirical_ppg + (1-w) * prior_ppg
-    # w = total_games / (total_games + K)
-    def shrink(row):
-        prior_ppg = lookup_prior(row["position"], row.get("age"), priors)
-        w = row["total_games"] / (row["total_games"] + shrinkage_k)
+    # Bayesian shrinkage — fully vectorized, no row-by-row apply
+    age_arr = player_history["age"].to_numpy(dtype=float, na_value=np.nan)
+    age_bracket_arr = np.select(
+        [np.isnan(age_arr) | (age_arr <= 23), age_arr <= 27, age_arr <= 30],
+        ["rookie",                              "young",       "prime"],
+        default="veteran",
+    )
 
-        # Apply age regression: players 30+ lose ~3% per year above 30
-        age = row.get("age")
-        age_adj = 1.0
-        if age is not None and not np.isnan(age) and age > 30:
-            age_adj = max(0.7, 1.0 - 0.03 * (age - 30))
+    # Build prior_ppg vector using the priors dict
+    fallback_order = ["young", "prime", "rookie", "veteran", "unknown"]
+    prior_ppg_arr = np.array([
+        priors.get((pos, bracket),
+            next((priors[pos, fb] for fb in fallback_order if (pos, fb) in priors), 0.0))
+        for pos, bracket in zip(player_history["position"], age_bracket_arr)
+    ])
 
-        posterior_ppg = (w * row["ppg"] + (1 - w) * prior_ppg) * age_adj
-        return posterior_ppg * 17   # project over a 17-game season
+    w = player_history["total_games"].to_numpy() / (
+        player_history["total_games"].to_numpy() + shrinkage_k
+    )
+    age_adj = np.where(age_arr > 30, np.clip(1.0 - 0.03 * (age_arr - 30), 0.7, 1.0), 1.0)
 
-    player_history["projected_fpts"] = player_history.apply(shrink, axis=1)
+    player_history["projected_fpts"] = (
+        (w * player_history["ppg"].to_numpy() + (1 - w) * prior_ppg_arr) * age_adj * 17
+    )
 
-    # Carry useful columns
     keep_cols = [
         "player_id", "player_name", "position", "age",
         "total_games", "seasons", "ppg", "projected_fpts",
     ]
-    if "display_name" in player_history.columns:
-        keep_cols.append("display_name")
-
     return player_history[[c for c in keep_cols if c in player_history.columns]].copy()
 
 
@@ -253,17 +231,22 @@ def compute_replacement_levels(
 ) -> dict[str, float]:
     """
     Determine replacement-level projected points for each position.
-    Replacement player = the last starter expected to be rostered.
+
+    Replacement player = the last player expected to be rostered (starters + bench).
+    Using starter counts alone puts only ~80 players above replacement, which
+    concentrates all budget at the top and inflates values. Including bench depth
+    expands the pool to ~150 players and produces realistic auction prices.
     """
     teams   = league["teams"]
     roster  = league["roster"]
     flex_n  = teams * roster.get("FLEX", 1)
+    depth   = BENCH_DEPTH
 
     starters = {
-        "QB":  teams * roster.get("QB", 1),
-        "RB":  teams * roster.get("RB", 2) + round(flex_n * FLEX_SPLIT["RB"]),
-        "WR":  teams * roster.get("WR", 2) + round(flex_n * FLEX_SPLIT["WR"]),
-        "TE":  teams * roster.get("TE", 1) + round(flex_n * FLEX_SPLIT["TE"]),
+        "QB":  round(teams * roster.get("QB", 1) * depth["QB"]),
+        "RB":  round(teams * roster.get("RB", 2) * depth["RB"] + flex_n * FLEX_SPLIT["RB"]),
+        "WR":  round(teams * roster.get("WR", 2) * depth["WR"] + flex_n * FLEX_SPLIT["WR"]),
+        "TE":  round(teams * roster.get("TE", 1) * depth["TE"] + flex_n * FLEX_SPLIT["TE"]),
     }
 
     levels = {}
@@ -290,10 +273,14 @@ def compute_auction_values(
     teams  = league["teams"]
     budget = league["budget"]
     roster = league["roster"]
+    bench  = league.get("bench", 6)
+    ir     = league.get("IR", 1)
 
-    total_starter_slots = teams * sum(roster.values())
-    min_bid = league["min_bid"]
-    hittable = teams * budget - total_starter_slots * min_bid
+    # Hittable = total budget minus every roster spot's minimum bid.
+    # Including bench and IR here because those slots do consume real budget.
+    total_roster_slots = teams * (sum(roster.values()) + bench + ir)
+    min_bid  = league["min_bid"]
+    hittable = teams * budget - total_roster_slots * min_bid
 
     repl_levels = compute_replacement_levels(projections, league)
 
@@ -318,7 +305,7 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
     players_path = os.path.join(DATA_DIR, "players.csv")
 
     if not os.path.exists(stats_path):
-        sys.exit("Missing data/seasonal_stats.csv. Run webscraping.py first.")
+        raise FileNotFoundError("Missing data/seasonal_stats.csv — run webscraping.py first.")
 
     print("Loading data...")
     stats   = pd.read_csv(stats_path, low_memory=False)
@@ -330,9 +317,13 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
     print("Computing auction values...")
     result = compute_auction_values(projections)
 
-    out = os.path.join(DATA_DIR, "projections.csv")
-    result.to_csv(out, index=False)
-    print(f"Saved {len(result):,} players → {out}")
+    try:
+        out = os.path.join(DATA_DIR, "projections.csv")
+        result.to_csv(out, index=False)
+        print(f"Saved {len(result):,} players -> {out}")
+    except OSError:
+        pass  # read-only filesystem on Streamlit Cloud — return result without saving
+
     print(result[["player_name", "position", "projected_fpts", "auction_value"]].head(20).to_string(index=False))
     return result
 

@@ -2,7 +2,6 @@ nfl_data_py>=0.1.9
 pandas>=2.2
 numpy>=2.0
 scikit-learn>=1.5
-scipy>=1.13
 requests>=2.31
 beautifulsoup4>=4.12
 streamlit>=1.35

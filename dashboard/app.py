@@ -10,15 +10,26 @@ import os
 import sys
 
 import pandas as pd
-import numpy as np
 import streamlit as st
 import plotly.express as px
 
 # Allow imports from parent directory when running from dashboard/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from projection_engine import run as run_projections, LEAGUE
+from projection_engine import run as run_projections
 from reprice_engine import AuctionState, DraftResult, reprice, position_market_summary
+
+# ─── Cached Loaders ───────────────────────────────────────────────────────────
+# @st.cache_data memoizes by arguments — Streamlit won't re-read the CSV on
+# every rerun (which happens on every user interaction).
+
+@st.cache_data
+def load_projections_csv(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+@st.cache_data(show_spinner="Running projection engine...")
+def compute_projections(ppr: float, projection_season: int) -> pd.DataFrame:
+    return run_projections(ppr=ppr, projection_season=projection_season)
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 
@@ -54,13 +65,13 @@ st.sidebar.divider()
 
 proj_season = st.sidebar.number_input("Projection Season", min_value=2020, max_value=2030, value=2026)
 
+PROJECTIONS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "projections.csv")
+
 if st.sidebar.button("🔄 Load / Refresh Projections"):
-    projections_path = os.path.join(os.path.dirname(__file__), "..", "data", "projections.csv")
-    if os.path.exists(projections_path):
-        df = pd.read_csv(projections_path)
+    if os.path.exists(PROJECTIONS_PATH):
+        df = load_projections_csv(PROJECTIONS_PATH)
     else:
-        with st.spinner("Running projection engine..."):
-            df = run_projections(ppr=ppr, projection_season=proj_season)
+        df = compute_projections(ppr, proj_season)
     st.session_state.projections = df
     st.session_state.auction_state = AuctionState(teams=num_teams, budget=float(budget))
     st.sidebar.success(f"Loaded {len(df):,} players.")
@@ -70,14 +81,16 @@ if st.sidebar.button("🗑️ Reset Auction"):
     st.session_state.auction_state = AuctionState(teams=num_teams, budget=float(budget))
     st.sidebar.success("Auction state cleared.")
 
-# ─── Load projections (auto if CSV exists) ────────────────────────────────────
+# ─── Auto-load projections on first visit ─────────────────────────────────────
 
-projections_path = os.path.join(os.path.dirname(__file__), "..", "data", "projections.csv")
-if st.session_state.projections is None and os.path.exists(projections_path):
-    st.session_state.projections = pd.read_csv(projections_path)
+if st.session_state.projections is None and os.path.exists(PROJECTIONS_PATH):
+    st.session_state.projections = load_projections_csv(PROJECTIONS_PATH)
 
 projections = st.session_state.projections
 state       = st.session_state.auction_state
+
+# Reprice once per render and share across tabs
+repriced = reprice(projections, state) if projections is not None else None
 
 # ─── Main Tabs ────────────────────────────────────────────────────────────────
 
@@ -93,12 +106,9 @@ tab_board, tab_live, tab_teams, tab_results = st.tabs([
 with tab_board:
     st.header("Player Board")
 
-    if projections is None:
+    if repriced is None:
         st.info("Click **Load / Refresh Projections** in the sidebar to get started.")
         st.stop()
-
-    # Reprice using current auction state
-    repriced = reprice(projections, state)
 
     # Filters
     col1, col2, col3 = st.columns(3)
@@ -158,11 +168,10 @@ with tab_board:
 with tab_live:
     st.header("Live Draft — Record Picks")
 
-    if projections is None:
+    if repriced is None:
         st.info("Load projections first (sidebar).")
     else:
-        repriced_live = reprice(projections, state)
-        available = repriced_live[~repriced_live["player_id"].isin(state.drafted_ids())]
+        available = repriced[~repriced["player_id"].isin(state.drafted_ids())]
 
         with st.form("record_pick"):
             st.subheader("Record a Pick")
