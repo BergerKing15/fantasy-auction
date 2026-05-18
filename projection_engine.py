@@ -51,7 +51,7 @@ FLEX_SPLIT = {"RB": 0.40, "WR": 0.50, "TE": 0.10}
 # Lowering replacement level to include bench depth is what keeps values realistic —
 # only ~80 players have PAR if you use starter counts alone, concentrating all
 # dollars at the top. Bench depth spreads the pool to ~150 players.
-BENCH_DEPTH = {"QB": 1.5, "RB": 2.5, "WR": 2.5, "TE": 1.5}
+BENCH_DEPTH = {"QB": 1.5, "RB": 3.5, "WR": 3.5, "TE": 2.0}
 
 # How many seasons of history to weight together for the empirical estimate
 SEASONS_USED = 3
@@ -61,8 +61,9 @@ SEASONS_USED = 3
 RECENCY_WEIGHTS = {0: 1.0, 1: 0.7, 2: 0.4}
 
 # Bayesian shrinkage constant: player needs this many game-seasons to be
-# weighted equally against the position prior (16 ≈ one full season)
-SHRINKAGE_K = 16.0
+# weighted equally against the position prior. Lower = trust recent stats more.
+# K=8: a player with 3 full seasons (51 games) gets 86% empirical weight.
+SHRINKAGE_K = 8.0
 
 DATA_DIR = "data"
 
