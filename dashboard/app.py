@@ -12,20 +12,23 @@ import sys
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
 # Allow imports from parent directory when running from dashboard/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from projection_engine import run as run_projections
+from projection_engine import run as run_projections, compute_fantasy_points
 from reprice_engine import AuctionState, DraftResult, reprice, position_market_summary
 
 # ─── Cached Loaders ───────────────────────────────────────────────────────────
-# @st.cache_data memoizes by arguments — Streamlit won't re-read the CSV on
-# every rerun (which happens on every user interaction).
 
 @st.cache_data
 def load_projections_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
+
+@st.cache_data
+def load_seasonal_stats(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, low_memory=False)
 
 @st.cache_data(show_spinner="Running projection engine...")
 def compute_projections(ppr: float, projection_season: int) -> pd.DataFrame:
@@ -65,7 +68,9 @@ st.sidebar.divider()
 
 proj_season = st.sidebar.number_input("Projection Season", min_value=2020, max_value=2030, value=2026)
 
-PROJECTIONS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "projections.csv")
+DATA_DIR         = os.path.join(os.path.dirname(__file__), "..")
+PROJECTIONS_PATH = os.path.join(DATA_DIR, "data", "projections.csv")
+STATS_PATH       = os.path.join(DATA_DIR, "data", "seasonal_stats.csv")
 
 if st.sidebar.button("🔄 Load / Refresh Projections"):
     if os.path.exists(PROJECTIONS_PATH):
@@ -94,11 +99,12 @@ repriced = reprice(projections, state) if projections is not None else None
 
 # ─── Main Tabs ────────────────────────────────────────────────────────────────
 
-tab_board, tab_live, tab_teams, tab_results = st.tabs([
+tab_board, tab_live, tab_teams, tab_results, tab_player = st.tabs([
     "📋 Player Board",
     "🔴 Live Draft",
     "👥 Teams",
     "📊 Results",
+    "🏈 Player Profile",
 ])
 
 # ─── Tab 1: Player Board ──────────────────────────────────────────────────────
@@ -201,7 +207,7 @@ with tab_live:
                     projected_value=float(row["auction_value"]),
                 )
                 state.record_pick(pick)
-                st.success(f"Recorded: {selected_player} → {winning_team} for ${price_paid}")
+                st.success(f"Recorded: {selected_player} -> {winning_team} for ${price_paid}")
 
         # Position market summary
         st.subheader("Position Market Trends")
@@ -287,8 +293,145 @@ with tab_results:
             title="Actual vs Projected Price",
             labels={"projected_value": "Projected ($)", "actual_price": "Actual ($)"},
         )
-        # y=x reference line
         max_val = max(picks_df["projected_value"].max(), picks_df["actual_price"].max())
         fig3.add_shape(type="line", x0=0, y0=0, x1=max_val, y1=max_val,
                        line=dict(dash="dash", color="gray"))
         st.plotly_chart(fig3, use_container_width=True)
+
+# ─── Tab 5: Player Profile ────────────────────────────────────────────────────
+
+with tab_player:
+    st.header("Player Profile")
+
+    if repriced is None:
+        st.info("Load projections first (sidebar).")
+    else:
+        # Player selector
+        skill = repriced[repriced["position"].isin(["QB", "RB", "WR", "TE"])].copy()
+        skill_sorted = skill.sort_values("auction_value", ascending=False)
+        player_names = skill_sorted["player_name"].tolist()
+
+        selected = st.selectbox("Search / select a player", options=player_names)
+        if not selected:
+            st.stop()
+
+        row = skill[skill["player_name"] == selected].iloc[0]
+
+        # ── Header ──────────────────────────────────────────────────────────
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Position",  row["position"])
+        c2.metric("ADP Rank",  int(row["adp_rank"]) if pd.notna(row.get("adp_rank")) else "N/A")
+        c3.metric("Pre-Draft $", f"${row['auction_value']:.1f}")
+        c4.metric("Proj Pts",  f"{row['projected_fpts']:.0f}" if pd.notna(row.get("projected_fpts")) else "N/A")
+        age_val = row.get("age")
+        c5.metric("Age",       f"{age_val:.0f}" if pd.notna(age_val) else "N/A")
+
+        st.divider()
+
+        col_left, col_right = st.columns([1, 2])
+
+        # ── Left panel: snapshot ────────────────────────────────────────────
+        with col_left:
+            st.subheader("Valuation Breakdown")
+            val_data = {
+                "Component":   ["PAR Value", "DS Auction Value", "Final Blended ($)"],
+                "Value ($)":   [
+                    round(float(row.get("auction_value", 0)), 1),   # pre-blend = auction_value
+                    round(float(row["ds_auction_value"]), 1) if pd.notna(row.get("ds_auction_value")) else None,
+                    round(float(row["auction_value"]), 1),
+                ],
+            }
+            st.dataframe(pd.DataFrame(val_data), use_container_width=True, hide_index=True)
+
+            # DraftSharks metadata panel
+            ds_fields = {
+                "DS Proj Pts":    row.get("ds_proj"),
+                "Consensus Proj": row.get("consensus_proj"),
+                "Injury Risk":    row.get("injury_risk"),
+                "SOS":            row.get("sos"),
+                "Data Seasons":   row.get("seasons"),
+                "Recent PPG":     f"{row['ppg']:.2f}" if pd.notna(row.get("ppg")) else None,
+                "Experience":     row.get("years_of_experience"),
+            }
+            st.subheader("DraftSharks Data")
+            ds_rows = [{"Field": k, "Value": v} for k, v in ds_fields.items() if pd.notna(v) and v is not None]
+            if ds_rows:
+                st.dataframe(pd.DataFrame(ds_rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No DraftSharks data — refresh projections after running webscraping.py")
+
+        # ── Right panel: season history ──────────────────────────────────────
+        with col_right:
+            st.subheader("Season History")
+
+            if not os.path.exists(STATS_PATH):
+                st.caption("seasonal_stats.csv not found — run webscraping.py to generate it.")
+            else:
+                stats_df = load_seasonal_stats(STATS_PATH)
+                pid = row["player_id"]
+                # rookies have synthetic IDs like "adp_jeremiyah_love"
+                if str(pid).startswith("adp_"):
+                    player_stats = pd.DataFrame()
+                else:
+                    player_stats = stats_df[stats_df["player_id"] == pid].copy()
+
+                if player_stats.empty:
+                    st.caption("No historical stats available (rookie or new player).")
+                else:
+                    player_stats = player_stats.sort_values("season")
+                    player_stats["fpts"] = compute_fantasy_points(player_stats, ppr=ppr).round(1)
+                    player_stats["ppg"]  = (player_stats["fpts"] / player_stats["games"].clip(lower=1)).round(2)
+
+                    # Fantasy points trend chart
+                    fig_hist = go.Figure()
+                    fig_hist.add_trace(go.Bar(
+                        x=player_stats["season"].astype(str),
+                        y=player_stats["fpts"],
+                        name="Total Fpts",
+                        marker_color="steelblue",
+                    ))
+                    fig_hist.add_trace(go.Scatter(
+                        x=player_stats["season"].astype(str),
+                        y=player_stats["ppg"],
+                        name="PPG",
+                        yaxis="y2",
+                        mode="lines+markers",
+                        line=dict(color="orange", width=2),
+                    ))
+                    fig_hist.update_layout(
+                        title=f"{selected} — Fantasy Points by Season (PPR={ppr})",
+                        yaxis=dict(title="Total Fantasy Pts"),
+                        yaxis2=dict(title="PPG", overlaying="y", side="right"),
+                        legend=dict(orientation="h"),
+                        height=300,
+                    )
+                    st.plotly_chart(fig_hist, use_container_width=True)
+
+                    # Position-specific stat columns to show
+                    pos = row["position"]
+                    stat_cols: dict[str, str] = {"season": "Season", "games": "G", "fpts": "Fpts", "ppg": "PPG"}
+                    if pos == "QB":
+                        stat_cols.update({
+                            "completions": "Cmp", "attempts": "Att",
+                            "passing_yards": "Pass Yds", "passing_tds": "Pass TD",
+                            "interceptions": "INT", "rushing_yards": "Rush Yds",
+                        })
+                    elif pos == "RB":
+                        stat_cols.update({
+                            "carries": "Car", "rushing_yards": "Rush Yds",
+                            "rushing_tds": "Rush TD", "receptions": "Rec",
+                            "receiving_yards": "Rec Yds", "receiving_tds": "Rec TD",
+                        })
+                    else:  # WR / TE
+                        stat_cols.update({
+                            "targets": "Tgt", "receptions": "Rec",
+                            "receiving_yards": "Rec Yds", "receiving_tds": "Rec TD",
+                            "rushing_yards": "Rush Yds",
+                        })
+
+                    visible = [c for c in stat_cols if c in player_stats.columns]
+                    hist_table = player_stats[visible].rename(columns=stat_cols)
+                    # Round numeric columns
+                    for c in hist_table.select_dtypes(include="number").columns:
+                        hist_table[c] = hist_table[c].round(0).astype("Int64", errors="ignore")
+                    st.dataframe(hist_table, use_container_width=True, hide_index=True)

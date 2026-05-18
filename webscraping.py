@@ -1,10 +1,12 @@
 """
 webscraping.py
-Fetches player stats via nfl_data_py and ADP from FantasyPros.
+Fetches player stats via nfl_data_py and ADP/auction values from DraftSharks
+(with FantasyPros as fallback).
 Run directly: python webscraping.py
 Outputs: data/seasonal_stats.csv, data/players.csv, data/adp.csv
 """
 
+import io
 import os
 import time
 
@@ -274,13 +276,126 @@ def fetch_all_adp() -> pd.DataFrame:
     return combined
 
 
+# ─── DraftSharks ──────────────────────────────────────────────────────────────
+
+DS_BASE = "https://www.draftsharks.com"
+
+
+def _ds_login() -> requests.Session:
+    """Authenticate with DraftSharks using credentials from .env or environment."""
+    env_file = ".env" if os.path.exists(".env") else os.path.join(os.path.dirname(__file__), ".env")
+    creds: dict[str, str] = {}
+    if os.path.exists(env_file):
+        with open(env_file) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k and v:
+                    creds[k] = v
+
+    email    = creds.get("DRAFT_SHARKS_USER")    or os.environ.get("DRAFT_SHARKS_USER", "")
+    password = creds.get("DRAFT_SHARKS_PASSWORD") or os.environ.get("DRAFT_SHARKS_PASSWORD", "")
+    if not email or not password:
+        raise RuntimeError("DraftSharks credentials missing — set DRAFT_SHARKS_USER / DRAFT_SHARKS_PASSWORD in .env")
+
+    s = requests.Session()
+    s.headers.update({"User-Agent": HEADERS["User-Agent"]})
+
+    r = s.get(f"{DS_BASE}/login", timeout=15)
+    soup = BeautifulSoup(r.text, "html.parser")
+    csrf_input = soup.find("input", {"name": "_frontendCSRF"})
+    if csrf_input is None:
+        raise RuntimeError("Could not find CSRF token on DraftSharks login page")
+
+    resp = s.post(f"{DS_BASE}/login", data={
+        "_frontendCSRF":         csrf_input["value"],
+        "LoginForm[email]":      email,
+        "LoginForm[password]":   password,
+    }, timeout=15)
+
+    # Successful login redirects to "/" — still at /login means failure
+    if resp.url.rstrip("/").endswith("/login"):
+        raise RuntimeError("DraftSharks login failed — check credentials in .env")
+    return s
+
+
+def fetch_draftsharks_data() -> pd.DataFrame:
+    """
+    Fetch auction values and PPR rankings from DraftSharks CSV exports.
+
+    Returns a DataFrame written to data/adp.csv that is backward-compatible
+    with the old FantasyPros format (same column names) while also including
+    DraftSharks-specific fields: ds_auction_value, ds_proj, consensus_proj,
+    injury_risk, sos used by projection_engine for more accurate blending.
+    """
+    print("Fetching DraftSharks data...")
+    s = _ds_login()
+
+    print("  Downloading auction values...")
+    av_resp = s.get(f"{DS_BASE}/auction-values/export?format=csv", timeout=30)
+    av_resp.raise_for_status()
+    av_df = pd.read_csv(io.StringIO(av_resp.text))
+
+    print("  Downloading PPR rankings...")
+    rk_resp = s.get(f"{DS_BASE}/rankings/export?format=csv", timeout=30)
+    rk_resp.raise_for_status()
+    rk_df = pd.read_csv(io.StringIO(rk_resp.text))
+
+    # Parse DS AuctionValue: "$49" -> 49.0
+    av_df["ds_auction_value"] = (
+        av_df["DS AuctionValue"].str.replace("$", "", regex=False).astype(float)
+    )
+
+    # Position rank: 1 = best at that position
+    av_df = av_df.sort_values("Rank").copy()
+    av_df["pos_rank"] = av_df.groupby("Fantasy Position").cumcount() + 1
+
+    # POS column in FantasyPros style ("RB3", "WR12") for backward compat
+    av_df["POS"] = av_df["Fantasy Position"] + av_df["pos_rank"].astype(str)
+
+    # Merge snake-draft ADP from rankings data
+    rk_merge = rk_df[["Player", "Team", "ADP"]].rename(columns={"ADP": "ds_adp"})
+    av_df = av_df.merge(rk_merge, on=["Player", "Team"], how="left")
+
+    # Build "PlayerTeam (Bye)" for backward compat with projection_engine name matching
+    av_df["PlayerTeam (Bye)"] = (
+        av_df["Player"] + " " + av_df["Team"].fillna("") +
+        "(" + av_df["Bye"].astype(str) + ")"
+    )
+
+    result = av_df.rename(columns={
+        "Fantasy Position": "position",
+        "DS Proj":          "ds_proj",
+        "Consensus Proj":   "consensus_proj",
+        "InjuryRisk":       "injury_risk",
+        "SOS":              "sos",
+    }).copy()
+    result["scoring_format"] = "ppr"
+
+    keep = [
+        "scoring_format", "Rank", "Player", "Team", "position",
+        "POS", "PlayerTeam (Bye)", "Bye", "ds_auction_value", "ds_adp",
+        "ds_proj", "consensus_proj", "injury_risk", "sos",
+    ]
+    result = result[[c for c in keep if c in result.columns]]
+
+    out = os.path.join(DATA_DIR, "adp.csv")
+    result.to_csv(out, index=False)
+    print(f"  Saved {len(result):,} rows -> {out}")
+    return result
+
+
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     fetch_player_info()
     fetch_seasonal_stats()
-    fetch_all_adp()
+    # Prefer DraftSharks (richer data); fall back to FantasyPros on failure
+    try:
+        fetch_draftsharks_data()
+    except Exception as exc:
+        print(f"  DraftSharks failed ({exc}), falling back to FantasyPros ADP...")
+        fetch_all_adp()
     print("\nAll data saved to data/. Run projection_engine.py next.")
 
 

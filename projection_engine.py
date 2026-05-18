@@ -76,13 +76,14 @@ DATA_DIR = "data"
 
 # ─── ADP Blend ────────────────────────────────────────────────────────────────
 
-# Position-specific auction value targets derived from RotoWire 12-team $200 PPR ranges.
-# top/bottom = top-1 and top-10 values; k derived as (top-bottom)/ln(10).
+# Position-specific auction value targets calibrated from DraftSharks 2026 12-team PPR data.
+# top = rank-1 DS auction value, bottom = rank-10 DS auction value; k = (top-bottom)/ln(10).
+# Used as fallback when a player isn't found in the DraftSharks CSV direct lookup.
 POS_ADP_PARAMS = {
-    "QB":  {"top": 17, "bottom":  4, "k": (17 -  4) / np.log(10)},
-    "RB":  {"top": 43, "bottom": 26, "k": (43 - 26) / np.log(10)},
-    "WR":  {"top": 25, "bottom": 12, "k": (25 - 12) / np.log(10)},
-    "TE":  {"top": 13, "bottom":  2, "k": (13 -  2) / np.log(10)},
+    "QB":  {"top": 31, "bottom": 13, "k": (31 - 13) / np.log(10)},
+    "RB":  {"top": 49, "bottom": 30, "k": (49 - 30) / np.log(10)},
+    "WR":  {"top": 47, "bottom": 30, "k": (47 - 30) / np.log(10)},
+    "TE":  {"top": 25, "bottom":  9, "k": (25 -  9) / np.log(10)},
     "K":   {"top":  2, "bottom":  1, "k": 0.1},
     "DST": {"top":  3, "bottom":  1, "k": (3 - 1) / np.log(10)},
 }
@@ -107,9 +108,12 @@ def _clean_adp_name(raw: str) -> str:
 def blend_adp(result: pd.DataFrame, adp_path: str,
               blend: float = ADP_BLEND) -> pd.DataFrame:
     """
-    Blend PAR-based values with position-specific ADP-implied values.
-    ADP implied values are calibrated per position to RotoWire market ranges,
-    capturing positional scarcity (RBs worth more than WRs in PPR even at same ADP rank).
+    Blend PAR-based values with expert ADP-implied values.
+
+    If the adp.csv contains DraftSharks data (has ds_auction_value column), uses
+    their consensus auction values directly — more accurate than a log curve.
+    Falls back to the position-rank log curve for players not in DraftSharks,
+    and for legacy FantasyPros-format files.
     """
     if blend == 0 or not os.path.exists(adp_path):
         return result
@@ -118,11 +122,16 @@ def blend_adp(result: pd.DataFrame, adp_path: str,
     ppr = adp_df[adp_df["scoring_format"] == "ppr"].copy()
     ppr = ppr.dropna(subset=["Rank", "POS"])
 
-    # Parse position and position-specific rank from POS column (e.g. "RB3" → pos=RB, rank=3)
     ppr["pos"]      = ppr["POS"].str.extract(r"^([A-Z]+)")[0]
     ppr["pos_rank"] = pd.to_numeric(ppr["POS"].str.extract(r"(\d+)$")[0], errors="coerce").fillna(999).astype(int)
     ppr["adp_name"] = ppr["PlayerTeam (Bye)"].apply(_clean_adp_name)
-    ppr["adp_value"] = ppr.apply(lambda r: _pos_adp_value(r["pos"], r["pos_rank"]), axis=1)
+
+    # DraftSharks format: use expert consensus auction values directly.
+    # FantasyPros fallback: compute from position-rank log curve.
+    if "ds_auction_value" in ppr.columns:
+        ppr["adp_value"] = ppr["ds_auction_value"].fillna(0).clip(lower=1.0)
+    else:
+        ppr["adp_value"] = ppr.apply(lambda r: _pos_adp_value(r["pos"], r["pos_rank"]), axis=1)
 
     adp_lookup = ppr.set_index("adp_name")["adp_value"].to_dict()
 
@@ -464,8 +473,13 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
             rows = []
             for _, row in missing_adp.iterrows():
                 pos = row["pos"]
-                adp_val = _pos_adp_value(pos, int(row["pos_rank"]))
-                ppg     = rookie_prior.get(pos, 10.0)
+                # Use DraftSharks direct value when available; otherwise log curve
+                ds_val = row.get("ds_auction_value") if "ds_auction_value" in row.index else None
+                adp_val = (
+                    float(ds_val) if pd.notna(ds_val) and float(ds_val) > 0
+                    else _pos_adp_value(pos, int(row["pos_rank"]))
+                )
+                ppg = rookie_prior.get(pos, 10.0)
                 rows.append({
                     "player_id":      f"adp_{row['adp_name'].replace(' ', '_')}",
                     "player_name":    _clean_adp_name(str(row["PlayerTeam (Bye)"])).title(),
@@ -513,6 +527,30 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
     if not players.empty and "years_of_experience" in players.columns:
         yoe = players[["gsis_id", "years_of_experience"]].rename(columns={"gsis_id": "player_id"})
         result = result.merge(yoe, on="player_id", how="left")
+
+    # Merge DraftSharks metadata (DS proj, injury risk, SOS) for display in dashboard
+    if os.path.exists(adp_path):
+        adp_meta = pd.read_csv(adp_path)
+        if "ds_auction_value" in adp_meta.columns:  # DraftSharks format
+            meta_cols = [c for c in ["ds_proj", "consensus_proj", "injury_risk", "sos", "ds_auction_value"] if c in adp_meta.columns]
+            if meta_cols:
+                adp_meta = adp_meta[adp_meta["scoring_format"] == "ppr"].copy()
+                adp_meta["_match"] = adp_meta["PlayerTeam (Bye)"].apply(_clean_adp_name)
+                adp_meta = adp_meta[["_match"] + meta_cols].drop_duplicates("_match")
+                result["_match"]      = result["player_name"].str.lower().str.strip()
+                result["_match_bare"] = result["_match"].str.replace(
+                    r"\s+(jr\.?|sr\.?|i{2,3}v?|iv)$", "", regex=True, flags=re.IGNORECASE
+                ).str.strip()
+                result = result.merge(adp_meta, on="_match", how="left")
+                # Fill bare-name matches for unmatched rows
+                still_missing = result[meta_cols[0]].isna() if meta_cols else pd.Series(False, index=result.index)
+                if still_missing.any():
+                    fill = result[still_missing].drop(columns=meta_cols, errors="ignore").merge(
+                        adp_meta.rename(columns={"_match": "_match_bare"}),
+                        on="_match_bare", how="left",
+                    )
+                    result.loc[still_missing, meta_cols] = fill[meta_cols].values
+                result.drop(columns=["_match", "_match_bare"], errors="ignore", inplace=True)
 
     # Attach prior-season actual fpts so the dashboard can show last year's performance
     prev_season = projection_season - 1
