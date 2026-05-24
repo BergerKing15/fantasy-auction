@@ -348,16 +348,18 @@ def fetch_draftsharks_data() -> pd.DataFrame:
     print("Fetching DraftSharks PPR data...")
     s = _ds_login()
 
-    # Visit PPR pages first so session/cookies reflect PPR context
+    # Visit PPR pages first; pprSuperflexSlug=ppr is the required parameter
+    # for the export endpoint to return PPR-scored values (without it, the
+    # endpoint silently returns standard/non-PPR values).
     s.get(f"{DS_BASE}/auction-values/ppr", timeout=15)
     print("  Downloading PPR auction values...")
-    av_resp = s.get(f"{DS_BASE}/auction-values/export?format=csv&scoring=ppr", timeout=30)
+    av_resp = s.get(f"{DS_BASE}/auction-values/export?format=csv&pprSuperflexSlug=ppr", timeout=30)
     av_resp.raise_for_status()
     av_df = pd.read_csv(io.StringIO(av_resp.text))
 
     s.get(f"{DS_BASE}/rankings/ppr", timeout=15)
     print("  Downloading PPR rankings...")
-    rk_resp = s.get(f"{DS_BASE}/rankings/export?format=csv&scoring=ppr", timeout=30)
+    rk_resp = s.get(f"{DS_BASE}/rankings/export?format=csv&pprSuperflexSlug=ppr", timeout=30)
     rk_resp.raise_for_status()
     rk_df = pd.read_csv(io.StringIO(rk_resp.text))
 
