@@ -1,0 +1,31 @@
+1.  [X] I entered sample data into Live Draft.  I have no way of deleting it.
+        → Added "Manage Picks" section in Live Draft tab with delete and price-correction controls.
+2.  [X] I need a way to correct typos - I enter $1 instead of $10
+        → "Correct a price" form in Live Draft lets you select any pick and update the dollar amount.
+3.  [X] Can you create a drop down menu listing all the owners to speed up data input?  The owners are:  Me, Tov, Daryl, Adam, Rich, Ganz, Marc, Ryan, Rob, Elliott, New Guy, Scott
+        → Owner name is now a dropdown with all 12 owners pre-loaded.
+4.  [X] Please add a method for identifying targets and players to avoid.
+        → ⭐ Target and ❌ Avoid buttons on Player Profile. Tags show in Player Board with a Tag Filter dropdown.
+5.  [X] Can you number the players so I can compare against ADP?
+        → "Rank" column added as the first column in the Player Board (1, 2, 3... sorted by value).
+        The "ADP" column shows DraftSharks rank for direct comparison.
+6.  [X] Please add a way to add comments to Player Profile.
+        → "Notes / Comments" text area added to every Player Profile. Saved in session state.
+7.  [X] What was your valuation method?
+        → Expandable "How are values calculated?" section at the bottom of the Player Board tab.
+8.  [X] the "Show Drafted Players" checkbox doesn't work.
+        → Fixed. reprice() now accepts exclude_drafted=False so the board can include already-drafted players.
+9.  [X] QBs look wrong.  Tua, Flacco, Fields, Cousins and Russell Wilson are not starters.  Derek Carr retired.  Is Shough too low?
+        → Player board now filters to DraftSharks-only players for skill positions.
+        Flacco, Justin Fields, Russell Wilson, and Derek Carr are excluded (not in DS 2026 rankings).
+        Tua ($1, rank 303) and Cousins ($1, rank 347) remain as DS still lists them as backups.
+        Tyler Shough is at DS rank 110 / $8 — that's DS's valuation for a developing starter.
+10. [X] Are you sure the total amount allocated to players doesn't exceed $2400?  There seem to be too many $1 players.
+        → Verified: DraftSharks top-180 players sum to $2,441 (vs $2,400 budget) — correctly calibrated.
+        The ~360 players showing at $1 are fringe/backup players that won't all be drafted; they go
+        for $1 if nominated. The Player Board header now shows total projected value vs league budget.
+11. [X] I need a spot to track my budget. I will assign target prices for each position prior to the draft. I want to be able to compare that against actual. In particular, I need to know where I have a surplus or deficit
+        → "My Budget Plan" table added to the Teams tab. Shows MIN/MAX targets and ACTUAL spend for
+        picks recorded under owner "Me". Shows ✅/⚠️ indicators vs MIN and MAX.
+12. [X] Can you add something like this to the Teams page?
+        → See above — the exact slot structure (QB, RB1-5, WR1-5, TE, DEF, K, flex spots, totals) is now on the Teams tab.
