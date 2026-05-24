@@ -313,6 +313,8 @@ if "avoid_list" not in st.session_state:
     st.session_state.avoid_list = set()
 if "player_comments" not in st.session_state:
     st.session_state.player_comments = {}
+if "budget_plan" not in st.session_state:
+    st.session_state.budget_plan = {k: list(v) for k, v in DEFAULT_BUDGET_PLAN.items()}
 
 # ─── Sidebar: Settings ────────────────────────────────────────────────────────
 
@@ -679,47 +681,89 @@ with tab_teams:
                 ]
                 st.dataframe(pd.DataFrame(pick_rows), use_container_width=True)
 
-    # ── Tasks 11 & 12: My Budget Tracker ─────────────────────────────────────
+    # ── My Budget Tracker (editable) ─────────────────────────────────────────
     st.divider()
     st.subheader("My Budget Plan")
-    st.caption("Enter target MIN/MAX spend per slot. ACTUAL is filled from picks recorded to 'Me'.")
+    st.caption("Edit MIN $ and MAX $ directly in the table. ACTUAL auto-fills from picks recorded under 'Me'.")
 
     my_picks = state.team_rosters.get("Me", [])
 
-    # Group my picks by position (assign to slots in order)
+    # Map actual spend to slots in position order
     pos_spend: dict[str, list[float]] = {}
     for p in my_picks:
         pos_spend.setdefault(p.position, []).append(p.actual_price)
 
-    plan_rows = []
-    for slot, (lo, hi) in DEFAULT_BUDGET_PLAN.items():
-        # Derive base position from slot name (e.g. "RB1" → "RB")
-        base_pos = "".join(c for c in slot if c.isalpha()).rstrip("12345").replace("/", "")
-        actual = None
-        if base_pos in pos_spend and pos_spend[base_pos]:
-            actual = pos_spend[base_pos].pop(0)
+    plan = st.session_state.budget_plan
 
-        plan_rows.append({
-            "Slot":   slot,
-            "MIN $":  lo,
-            "MAX $":  hi,
-            "ACTUAL": f"${actual:.0f}" if actual is not None else "—",
-            "vs MIN": ("✅" if actual and actual >= lo else ("⚠️ Low" if actual else "")) ,
-            "vs MAX": ("⚠️ Over" if actual and actual > hi else ("✅" if actual else "")),
+    # Build editable rows (Slot/MIN/MAX only — ACTUAL computed separately)
+    edit_rows = [
+        {"Slot": slot, "MIN $": plan[slot][0], "MAX $": plan[slot][1]}
+        for slot in plan
+    ]
+    edit_df = pd.DataFrame(edit_rows)
+
+    edited = st.data_editor(
+        edit_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "Slot":  st.column_config.TextColumn("Slot", disabled=True),
+            "MIN $": st.column_config.NumberColumn("MIN $", min_value=0, max_value=500, step=1),
+            "MAX $": st.column_config.NumberColumn("MAX $", min_value=0, max_value=500, step=1),
+        },
+        key="budget_plan_editor",
+    )
+
+    # Persist any edits back to session state
+    for _, row in edited.iterrows():
+        slot = row["Slot"]
+        if slot in plan:
+            plan[slot] = [int(row["MIN $"]), int(row["MAX $"])]
+
+    # Compute and display ACTUAL + status columns read-only below editor
+    pos_spend2: dict[str, list[float]] = {}
+    for p in my_picks:
+        pos_spend2.setdefault(p.position, []).append(p.actual_price)
+
+    result_rows = []
+    for slot in plan:
+        lo, hi = plan[slot][0], plan[slot][1]
+        base_pos = "".join(c for c in slot if c.isalpha()).rstrip("12345").replace("/", "")
+        actual = pos_spend2[base_pos].pop(0) if base_pos in pos_spend2 and pos_spend2[base_pos] else None
+        surplus = (actual - lo) if actual is not None else None
+        result_rows.append({
+            "Slot":     slot,
+            "MIN $":    lo,
+            "MAX $":    hi,
+            "ACTUAL $": int(actual) if actual is not None else None,
+            "+/- MIN":  int(surplus) if surplus is not None else None,
+            "Status":   ("✅" if actual and lo <= actual <= hi
+                         else ("⚠️ Over MAX" if actual and actual > hi
+                         else ("⚠️ Under MIN" if actual and actual < lo else "—"))),
         })
 
-    # Totals
-    starters = {k: v for k, v in DEFAULT_BUDGET_PLAN.items()
-                if k not in ("RB3","RB4","RB5","WR4","WR5","QB2","RB/WR","RB/WR (2)")}
-    bench    = {k: v for k, v in DEFAULT_BUDGET_PLAN.items() if k not in starters}
-    total_lo = sum(v[0] for v in DEFAULT_BUDGET_PLAN.values())
-    total_hi = sum(v[1] for v in DEFAULT_BUDGET_PLAN.values())
     total_actual = sum(p.actual_price for p in my_picks)
-    plan_rows.append({"Slot": "─── Total ───", "MIN $": total_lo, "MAX $": total_hi,
-                      "ACTUAL": f"${total_actual:.0f}" if my_picks else "—", "vs MIN": "", "vs MAX": ""})
+    result_rows.append({
+        "Slot":     "TOTAL",
+        "MIN $":    sum(v[0] for v in plan.values()),
+        "MAX $":    sum(v[1] for v in plan.values()),
+        "ACTUAL $": int(total_actual) if my_picks else None,
+        "+/- MIN":  int(total_actual - sum(v[0] for v in plan.values())) if my_picks else None,
+        "Status":   "",
+    })
 
-    plan_df = pd.DataFrame(plan_rows)
-    st.dataframe(plan_df, use_container_width=True, hide_index=True)
+    st.dataframe(
+        pd.DataFrame(result_rows),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "ACTUAL $": st.column_config.NumberColumn("ACTUAL $", format="$%d"),
+            "MIN $":    st.column_config.NumberColumn("MIN $",    format="$%d"),
+            "MAX $":    st.column_config.NumberColumn("MAX $",    format="$%d"),
+            "+/- MIN":  st.column_config.NumberColumn("+/- MIN",  format="%+d"),
+        },
+    )
 
 # ─── Tab 4: Results / Analysis ────────────────────────────────────────────────
 
