@@ -288,7 +288,16 @@ if st.session_state.projections is None and os.path.exists(PROJECTIONS_PATH):
 projections = st.session_state.projections
 state       = st.session_state.auction_state
 
-repriced     = reprice(projections, state) if projections is not None else None
+# Use DraftSharks auction values as the initial prices where available;
+# fall back to the PAR-based auction_value for players not in DraftSharks.
+if projections is not None and "ds_auction_value" in projections.columns:
+    projections_display = projections.copy()
+    has_ds = projections_display["ds_auction_value"].notna() & (projections_display["ds_auction_value"] > 0)
+    projections_display.loc[has_ds, "auction_value"] = projections_display.loc[has_ds, "ds_auction_value"]
+else:
+    projections_display = projections
+
+repriced     = reprice(projections_display, state) if projections_display is not None else None
 schedule_df  = load_schedule(SCHEDULE_PATH) if os.path.exists(SCHEDULE_PATH) else pd.DataFrame()
 
 # ─── Main Tabs ────────────────────────────────────────────────────────────────
@@ -510,7 +519,7 @@ with tab_player:
     if repriced is None:
         st.info("Load projections first (sidebar).")
     else:
-        skill = repriced[repriced["position"].isin(["QB", "RB", "WR", "TE"])].copy()
+        skill = repriced[repriced["position"].isin(["QB", "RB", "WR", "TE", "K", "DST"])].copy()
         player_names = skill.sort_values("auction_value", ascending=False)["player_name"].tolist()
 
         # Default to whatever was clicked in the board (if anything)
