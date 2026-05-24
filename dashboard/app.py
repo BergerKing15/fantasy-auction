@@ -155,12 +155,12 @@ def render_player_panel(player_name: str, repriced: pd.DataFrame,
         st.subheader(f"{player_name}  —  {pos}  ·  {team_label}{badge}")
 
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("ADP",         f"#{int(row['adp_rank'])}" if pd.notna(row.get("adp_rank")) else "—")
-        m2.metric("Pre-Draft $", f"${row['auction_value']:.1f}")
-        m3.metric("Proj Pts",    f"{row['projected_fpts']:.0f}" if pd.notna(row.get("projected_fpts")) else "—")
-        m4.metric("DS Value",    f"${row['ds_auction_value']:.0f}" if pd.notna(row.get("ds_auction_value")) else "—")
+        m1.metric("ADP",        f"#{int(row['adp_rank'])}" if pd.notna(row.get("adp_rank")) else "—")
+        m2.metric("DS Value $", f"${row['auction_value']:.0f}")
+        m3.metric("Market $",   f"${row['market_auction_value']:.0f}" if pd.notna(row.get("market_auction_value")) else "—")
+        m4.metric("Proj Pts",   f"{row['projected_fpts']:.0f}" if pd.notna(row.get("projected_fpts")) else "—")
         m5.metric("Injury Risk", str(row.get("injury_risk") or "—"))
-        m6.metric("Bye Wk",      int(row["Bye"]) if pd.notna(row.get("Bye")) else "—")
+        m6.metric("Bye Wk",     int(row["Bye"]) if pd.notna(row.get("Bye")) else "—")
 
     # ── Target / Avoid controls ───────────────────────────────────────────────
     tag_c1, tag_c2, tag_c3 = st.columns([1, 1, 4])
@@ -361,26 +361,33 @@ state       = st.session_state.auction_state
 # ── Filter retirees / non-DS players (Task 9) ────────────────────────────────
 # Only show skill players that DraftSharks ranks; filters out retired/irrelevant
 # players who appear in historical stats but not in the 2026 DS data.
-# K are sourced from adp.csv directly since the projection engine doesn't cover them.
+# K and market_auction_value are sourced from adp.csv directly.
 if projections is not None:
     skill_mask = projections["position"].isin(["QB", "RB", "WR", "TE"])
     has_ds = projections["ds_auction_value"].notna() & (projections["ds_auction_value"] > 0)
     projections_display = projections[~skill_mask | has_ds].copy()
 
-    # Bring in K from adp.csv since projection engine doesn't populate them
     if os.path.exists(ADP_PATH):
         adp_raw = pd.read_csv(ADP_PATH)
-        k_rows  = adp_raw[adp_raw["position"] == "K"].copy()
+
+        # Merge market_auction_value into projections_display (not in projection_engine output)
+        if "market_auction_value" in adp_raw.columns:
+            mav_map = adp_raw.set_index("Player")["market_auction_value"].to_dict()
+            projections_display["market_auction_value"] = (
+                projections_display["player_name"].map(mav_map)
+            )
+
+        # Bring in K from adp.csv since projection engine doesn't populate them
+        k_rows = adp_raw[adp_raw["position"] == "K"].copy()
         if not k_rows.empty:
             k_rows = k_rows.rename(columns={"Player": "player_name", "Rank": "adp_rank"})
-            k_rows["position"]       = "K"
-            k_rows["auction_value"]  = k_rows["ds_auction_value"].fillna(1.0)
-            k_rows["repriced_value"] = k_rows["auction_value"]
-            k_rows["player_id"]      = "adp_k_" + k_rows["player_name"].str.replace(" ", "_")
-            k_rows["projected_fpts"] = pd.NA
-            k_rows["ppg"]            = pd.NA
-            k_rows["seasons"]        = pd.NA
-            # Merge into display, skipping kickers already present
+            k_rows["position"]             = "K"
+            k_rows["auction_value"]        = k_rows["ds_auction_value"].fillna(1.0)
+            k_rows["repriced_value"]       = k_rows["auction_value"]
+            k_rows["player_id"]            = "adp_k_" + k_rows["player_name"].str.replace(" ", "_")
+            k_rows["projected_fpts"]       = pd.NA
+            k_rows["ppg"]                  = pd.NA
+            k_rows["seasons"]              = pd.NA
             existing_k = set(projections_display[projections_display["position"] == "K"]["player_name"])
             new_k = k_rows[~k_rows["player_name"].isin(existing_k)]
             if not new_k.empty:
@@ -464,18 +471,19 @@ with tab_board:
     prev_col = next((c for c in display.columns if c.startswith("fpts_")), None)
     exp_col  = "years_of_experience" if "years_of_experience" in display.columns else None
     display_cols = {
-        "Rank":             "Rank",
-        "Tag":              "Tag",
-        "player_name":      "Player",
-        "position":         "Pos",
-        "adp_rank":         "ADP",
+        "Rank":                  "Rank",
+        "Tag":                   "Tag",
+        "player_name":           "Player",
+        "position":              "Pos",
+        "adp_rank":              "ADP",
         **({"years_of_experience": "Exp"} if exp_col else {}),
-        "projected_fpts":   "Proj Pts",
+        "projected_fpts":        "Proj Pts",
         **(  {prev_col: f"{prev_col[5:]} Actual"} if prev_col else {}),
-        "auction_value":    "Pre-Draft $",
-        "repriced_value":   "Current $",
-        "ppg":              "Recent PPG",
-        "Status":           "Status",
+        "auction_value":         "DS Value $",
+        "market_auction_value":  "Market $",
+        "repriced_value":        "Current $",
+        "ppg":                   "Recent PPG",
+        "Status":                "Status",
     }
     show = (
         display[[c for c in display_cols if c in display.columns]]
@@ -502,9 +510,10 @@ with tab_board:
         on_select="rerun",
         selection_mode="single-row",
         column_config={
-            "Current $":   st.column_config.NumberColumn(format="$%.1f"),
-            "Pre-Draft $": st.column_config.NumberColumn(format="$%.1f"),
-            "Player":      st.column_config.TextColumn("Player"),
+            "Current $":  st.column_config.NumberColumn(format="$%.1f"),
+            "DS Value $": st.column_config.NumberColumn(format="$%.0f"),
+            "Market $":   st.column_config.NumberColumn(format="$%.0f"),
+            "Player":     st.column_config.TextColumn("Player"),
         },
     )
 
@@ -527,7 +536,7 @@ with tab_board:
     # Valuation method explanation (Task 7)
     with st.expander("ℹ️ How are values calculated?"):
         st.markdown("""
-**Pre-Draft $** is sourced directly from DraftSharks auction values (PPR, 12-team, $200 budget).
+**DS Value $** is DraftSharks' own PPR model value (12-team, $200 budget). **Market $** is the crowd-sourced auction market consensus from DraftSharks (reflects what owners typically pay).
 For players not in DraftSharks the value uses a Points-Above-Replacement (PAR) model:
 
 1. **Bayesian projection** — past PPG is shrunk toward a position average using `w = games / (games + 8)`.

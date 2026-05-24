@@ -337,29 +337,36 @@ def _ds_login() -> requests.Session:
 
 def fetch_draftsharks_data() -> pd.DataFrame:
     """
-    Fetch auction values and PPR rankings from DraftSharks CSV exports.
+    Fetch PPR auction values and rankings from DraftSharks CSV exports.
 
-    Returns a DataFrame written to data/adp.csv that is backward-compatible
-    with the old FantasyPros format (same column names) while also including
-    DraftSharks-specific fields: ds_auction_value, ds_proj, consensus_proj,
-    injury_risk, sos used by projection_engine for more accurate blending.
+    Navigates to the PPR pages first for session context, then exports.
+    Both dollar columns are preserved:
+      - ds_auction_value   : DraftSharks' own PPR model value
+      - market_auction_value: crowd-sourced auction market consensus
+    Returns a DataFrame written to data/adp.csv.
     """
-    print("Fetching DraftSharks data...")
+    print("Fetching DraftSharks PPR data...")
     s = _ds_login()
 
-    print("  Downloading auction values...")
-    av_resp = s.get(f"{DS_BASE}/auction-values/export?format=csv", timeout=30)
+    # Visit PPR pages first so session/cookies reflect PPR context
+    s.get(f"{DS_BASE}/auction-values/ppr", timeout=15)
+    print("  Downloading PPR auction values...")
+    av_resp = s.get(f"{DS_BASE}/auction-values/export?format=csv&scoring=ppr", timeout=30)
     av_resp.raise_for_status()
     av_df = pd.read_csv(io.StringIO(av_resp.text))
 
+    s.get(f"{DS_BASE}/rankings/ppr", timeout=15)
     print("  Downloading PPR rankings...")
-    rk_resp = s.get(f"{DS_BASE}/rankings/export?format=csv", timeout=30)
+    rk_resp = s.get(f"{DS_BASE}/rankings/export?format=csv&scoring=ppr", timeout=30)
     rk_resp.raise_for_status()
     rk_df = pd.read_csv(io.StringIO(rk_resp.text))
 
-    # Parse DS AuctionValue: "$49" -> 49.0
+    # Parse both dollar columns: "$49" -> 49.0
     av_df["ds_auction_value"] = (
         av_df["DS AuctionValue"].str.replace("$", "", regex=False).astype(float)
+    )
+    av_df["market_auction_value"] = (
+        av_df["AuctionMarketValue"].str.replace("$", "", regex=False).astype(float)
     )
 
     # Position rank: 1 = best at that position
@@ -369,8 +376,12 @@ def fetch_draftsharks_data() -> pd.DataFrame:
     # POS column in FantasyPros style ("RB3", "WR12") for backward compat
     av_df["POS"] = av_df["Fantasy Position"] + av_df["pos_rank"].astype(str)
 
-    # Merge snake-draft ADP from rankings data
-    rk_merge = rk_df[["Player", "Team", "ADP"]].rename(columns={"ADP": "ds_adp"})
+    # Merge snake-draft ADP + floor/ceiling from rankings
+    rk_merge = rk_df[["Player", "Team", "ADP", "Floor Proj", "CeilingProj"]].rename(columns={
+        "ADP":         "ds_adp",
+        "Floor Proj":  "floor_proj",
+        "CeilingProj": "ceiling_proj",
+    })
     av_df = av_df.merge(rk_merge, on=["Player", "Team"], how="left")
 
     # Build "PlayerTeam (Bye)" for backward compat with projection_engine name matching
@@ -390,8 +401,10 @@ def fetch_draftsharks_data() -> pd.DataFrame:
 
     keep = [
         "scoring_format", "Rank", "Player", "Team", "position",
-        "POS", "PlayerTeam (Bye)", "Bye", "ds_auction_value", "ds_adp",
-        "ds_proj", "consensus_proj", "injury_risk", "sos",
+        "POS", "PlayerTeam (Bye)", "Bye",
+        "ds_auction_value", "market_auction_value", "ds_adp",
+        "ds_proj", "consensus_proj", "floor_proj", "ceiling_proj",
+        "injury_risk", "sos",
     ]
     result = result[[c for c in keep if c in result.columns]]
 
