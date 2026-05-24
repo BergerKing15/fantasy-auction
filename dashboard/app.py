@@ -20,9 +20,36 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from projection_engine import run as run_projections, compute_fantasy_points
 from reprice_engine import AuctionState, DraftResult, reprice, position_market_summary
 
-# ─── Team abbreviation mapping ────────────────────────────────────────────────
+# ─── Constants ────────────────────────────────────────────────────────────────
+
 # DraftSharks uses LAR/JAC/LVR; nfl_data_py schedule uses LA/JAX/LV
 DS_TO_NFL = {"LAR": "LA", "JAC": "JAX", "LVR": "LV"}
+
+OWNERS = [
+    "Me", "Tov", "Daryl", "Adam", "Rich",
+    "Ganz", "Marc", "Ryan", "Rob", "Elliott", "New Guy", "Scott",
+]
+
+# Default per-position budget plan (MIN, MAX) for "My Team" tracker
+DEFAULT_BUDGET_PLAN = {
+    "QB":        (5,  10),
+    "RB1":       (20, 30),
+    "RB2":       (10, 19),
+    "WR1":       (25, 35),
+    "WR2":       (15, 25),
+    "WR3":       (10, 20),
+    "TE":        (8,  14),
+    "DEF":       (1,   1),
+    "K":         (1,   1),
+    "RB3":       (3,   8),
+    "RB4":       (3,   8),
+    "RB5":       (3,   8),
+    "WR4":       (2,   6),
+    "WR5":       (2,   6),
+    "QB2":       (1,   3),
+    "RB/WR":     (3,   6),
+    "RB/WR (2)": (1,   3),
+}
 
 # ─── Cached Loaders ───────────────────────────────────────────────────────────
 
@@ -63,7 +90,6 @@ def player_photo(headshot_url, width: int = 130) -> None:
 
 def get_team_schedule(player_row: pd.Series, schedule_df: pd.DataFrame) -> pd.DataFrame:
     """Return the week-by-week schedule for the player's team, including bye."""
-    # latest_team is in nfl_data_py format (matches schedule); Team is DraftSharks
     team = player_row.get("latest_team")
     if pd.isna(team) or not str(team).strip():
         ds = str(player_row.get("Team", "") or "")
@@ -85,14 +111,13 @@ def get_team_schedule(player_row: pd.Series, schedule_df: pd.DataFrame) -> pd.Da
     )
     games = games.rename(columns={"week": "Wk", "gameday": "Date"})
 
-    # Detect and insert bye week
     played_weeks = set(games["Wk"])
     max_wk = int(games["Wk"].max())
     for wk in range(1, max_wk + 2):
         if wk not in played_weeks:
             bye_row = pd.DataFrame([{"Wk": wk, "Date": "", "Opponent": "BYE", "H/A": "—"}])
             games = pd.concat([games, bye_row], ignore_index=True)
-            break  # typically one bye week
+            break
 
     return (
         games[["Wk", "Date", "Opponent", "H/A"]]
@@ -122,15 +147,56 @@ def render_player_panel(player_name: str, repriced: pd.DataFrame,
             str(row.get("latest_team") or row.get("Team") or "").strip() or "—"
         )
         pos = row.get("position", "")
-        st.subheader(f"{player_name}  —  {pos}  ·  {team_label}")
+
+        # Target / Avoid badge
+        is_target = player_name in st.session_state.get("targets", set())
+        is_avoid  = player_name in st.session_state.get("avoid_list", set())
+        badge = " ⭐ TARGET" if is_target else (" ❌ AVOID" if is_avoid else "")
+        st.subheader(f"{player_name}  —  {pos}  ·  {team_label}{badge}")
 
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("ADP",        f"#{int(row['adp_rank'])}" if pd.notna(row.get("adp_rank")) else "—")
+        m1.metric("ADP",         f"#{int(row['adp_rank'])}" if pd.notna(row.get("adp_rank")) else "—")
         m2.metric("Pre-Draft $", f"${row['auction_value']:.1f}")
-        m3.metric("Proj Pts",   f"{row['projected_fpts']:.0f}" if pd.notna(row.get("projected_fpts")) else "—")
-        m4.metric("DS Value",   f"${row['ds_auction_value']:.0f}" if pd.notna(row.get("ds_auction_value")) else "—")
+        m3.metric("Proj Pts",    f"{row['projected_fpts']:.0f}" if pd.notna(row.get("projected_fpts")) else "—")
+        m4.metric("DS Value",    f"${row['ds_auction_value']:.0f}" if pd.notna(row.get("ds_auction_value")) else "—")
         m5.metric("Injury Risk", str(row.get("injury_risk") or "—"))
-        m6.metric("Bye Wk",     int(row["Bye"]) if pd.notna(row.get("Bye")) else "—")
+        m6.metric("Bye Wk",      int(row["Bye"]) if pd.notna(row.get("Bye")) else "—")
+
+    # ── Target / Avoid controls ───────────────────────────────────────────────
+    tag_c1, tag_c2, tag_c3 = st.columns([1, 1, 4])
+    with tag_c1:
+        if is_target:
+            if st.button("Remove Target ⭐", key=f"untarget_{player_name}"):
+                st.session_state.targets.discard(player_name)
+                st.rerun()
+        else:
+            if st.button("Mark as Target ⭐", key=f"target_{player_name}"):
+                st.session_state.targets.add(player_name)
+                st.session_state.avoid_list.discard(player_name)
+                st.rerun()
+    with tag_c2:
+        if is_avoid:
+            if st.button("Remove Avoid ❌", key=f"unavoid_{player_name}"):
+                st.session_state.avoid_list.discard(player_name)
+                st.rerun()
+        else:
+            if st.button("Mark as Avoid ❌", key=f"avoid_{player_name}"):
+                st.session_state.avoid_list.add(player_name)
+                st.session_state.targets.discard(player_name)
+                st.rerun()
+
+    # ── Comments ──────────────────────────────────────────────────────────────
+    comments = st.session_state.get("player_comments", {})
+    existing = comments.get(player_name, "")
+    new_comment = st.text_area(
+        "Notes / Comments",
+        value=existing,
+        placeholder="Add scouting notes, injury updates, draft strategy...",
+        key=f"comment_{player_name}",
+        height=80,
+    )
+    if new_comment != existing:
+        st.session_state.player_comments[player_name] = new_comment
 
     # ── Bottom section: schedule | stats ─────────────────────────────────────
     sched_col, hist_col = st.columns([1, 2])
@@ -141,7 +207,6 @@ def render_player_panel(player_name: str, repriced: pd.DataFrame,
         if sched.empty:
             st.caption("Schedule unavailable.")
         else:
-            # Highlight bye weeks
             def _style_bye(val):
                 return "color: #888; font-style: italic;" if val == "BYE" else ""
             st.dataframe(
@@ -170,7 +235,6 @@ def render_player_panel(player_name: str, repriced: pd.DataFrame,
                         player_stats["fpts"] / player_stats["games"].clip(lower=1)
                     ).round(2)
 
-                    # Chart
                     fig = go.Figure()
                     fig.add_trace(go.Bar(
                         x=player_stats["season"].astype(str),
@@ -195,7 +259,6 @@ def render_player_panel(player_name: str, repriced: pd.DataFrame,
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
-                    # Stat table
                     pos = row.get("position", "")
                     stat_map: dict[str, str] = {
                         "season": "Season", "games": "G", "fpts": "Fpts", "ppg": "PPG"
@@ -244,6 +307,12 @@ if "profile_player" not in st.session_state:
     st.session_state.profile_player = None
 if "nav_to_profile" not in st.session_state:
     st.session_state.nav_to_profile = False
+if "targets" not in st.session_state:
+    st.session_state.targets = set()
+if "avoid_list" not in st.session_state:
+    st.session_state.avoid_list = set()
+if "player_comments" not in st.session_state:
+    st.session_state.player_comments = {}
 
 # ─── Sidebar: Settings ────────────────────────────────────────────────────────
 
@@ -265,6 +334,7 @@ DATA_DIR         = os.path.join(os.path.dirname(__file__), "..")
 PROJECTIONS_PATH = os.path.join(DATA_DIR, "data", "projections.csv")
 STATS_PATH       = os.path.join(DATA_DIR, "data", "seasonal_stats.csv")
 SCHEDULE_PATH    = os.path.join(DATA_DIR, "data", "schedule.csv")
+ADP_PATH         = os.path.join(DATA_DIR, "data", "adp.csv")
 
 if st.sidebar.button("🔄 Load / Refresh Projections"):
     if os.path.exists(PROJECTIONS_PATH):
@@ -288,14 +358,47 @@ if st.session_state.projections is None and os.path.exists(PROJECTIONS_PATH):
 projections = st.session_state.projections
 state       = st.session_state.auction_state
 
-# Use DraftSharks auction values as the initial prices where available;
-# fall back to the PAR-based auction_value for players not in DraftSharks.
-if projections is not None and "ds_auction_value" in projections.columns:
-    projections_display = projections.copy()
-    has_ds = projections_display["ds_auction_value"].notna() & (projections_display["ds_auction_value"] > 0)
-    projections_display.loc[has_ds, "auction_value"] = projections_display.loc[has_ds, "ds_auction_value"]
+# ── Filter retirees / non-DS players (Task 9) ────────────────────────────────
+# Only show skill players that DraftSharks ranks; filters out retired/irrelevant
+# players who appear in historical stats but not in the 2026 DS data.
+# K are sourced from adp.csv directly since the projection engine doesn't cover them.
+if projections is not None:
+    skill_mask = projections["position"].isin(["QB", "RB", "WR", "TE"])
+    has_ds = projections["ds_auction_value"].notna() & (projections["ds_auction_value"] > 0)
+    projections_display = projections[~skill_mask | has_ds].copy()
+
+    # Bring in K from adp.csv since projection engine doesn't populate them
+    if os.path.exists(ADP_PATH):
+        adp_raw = pd.read_csv(ADP_PATH)
+        k_rows  = adp_raw[adp_raw["position"] == "K"].copy()
+        if not k_rows.empty:
+            k_rows = k_rows.rename(columns={"Player": "player_name", "Rank": "adp_rank"})
+            k_rows["position"]       = "K"
+            k_rows["auction_value"]  = k_rows["ds_auction_value"].fillna(1.0)
+            k_rows["repriced_value"] = k_rows["auction_value"]
+            k_rows["player_id"]      = "adp_k_" + k_rows["player_name"].str.replace(" ", "_")
+            k_rows["projected_fpts"] = pd.NA
+            k_rows["ppg"]            = pd.NA
+            k_rows["seasons"]        = pd.NA
+            # Merge into display, skipping kickers already present
+            existing_k = set(projections_display[projections_display["position"] == "K"]["player_name"])
+            new_k = k_rows[~k_rows["player_name"].isin(existing_k)]
+            if not new_k.empty:
+                projections_display = pd.concat([projections_display, new_k], ignore_index=True)
 else:
     projections_display = projections
+
+# ── Use DraftSharks values as initial prices (Task: DS prices in dashboard) ───
+if projections_display is not None and "ds_auction_value" in projections_display.columns:
+    has_ds2 = projections_display["ds_auction_value"].notna() & (projections_display["ds_auction_value"] > 0)
+    projections_display.loc[has_ds2, "auction_value"] = projections_display.loc[has_ds2, "ds_auction_value"]
+
+# ── Normalize years_of_experience column name ─────────────────────────────────
+if projections_display is not None:
+    if "years_of_experience_x" in projections_display.columns and "years_of_experience" not in projections_display.columns:
+        projections_display = projections_display.rename(columns={"years_of_experience_x": "years_of_experience"})
+    if "years_of_experience_y" in projections_display.columns:
+        projections_display = projections_display.drop(columns=["years_of_experience_y"], errors="ignore")
 
 repriced     = reprice(projections_display, state) if projections_display is not None else None
 schedule_df  = load_schedule(SCHEDULE_PATH) if os.path.exists(SCHEDULE_PATH) else pd.DataFrame()
@@ -319,46 +422,78 @@ with tab_board:
         st.info("Click **Load / Refresh Projections** in the sidebar to get started.")
         st.stop()
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         pos_filter = st.multiselect(
-            "Position", options=["QB", "RB", "WR", "TE"], default=["QB", "RB", "WR", "TE"]
+            "Position", options=["QB", "RB", "WR", "TE", "K"], default=["QB", "RB", "WR", "TE"]
         )
     with col2:
         max_price = st.number_input("Max $ Value (filter)", min_value=1, max_value=300, value=200)
     with col3:
         show_drafted = st.checkbox("Show Drafted Players", value=False)
+    with col4:
+        tag_filter = st.selectbox("Tag Filter", ["All", "⭐ Targets Only", "❌ Avoid Only"])
 
-    display = repriced.copy()
-    if not show_drafted:
-        display = display[~display["player_id"].isin(state.drafted_ids())]
+    # Build display df — include drafted players when checkbox is on (Task 8 fix)
+    if show_drafted:
+        display = reprice(projections_display, state, exclude_drafted=False).copy()
+    else:
+        display = repriced.copy()
+
     if pos_filter:
         display = display[display["position"].isin(pos_filter)]
-    display = display[display["repriced_value"] <= max_price]
+    display = display[display["auction_value"] <= max_price]
+
+    if tag_filter == "⭐ Targets Only":
+        display = display[display["player_name"].isin(st.session_state.targets)]
+    elif tag_filter == "❌ Avoid Only":
+        display = display[display["player_name"].isin(st.session_state.avoid_list)]
+
+    # Add tag and rank columns
+    display = display.reset_index(drop=True)
+    display.insert(0, "Rank", display.index + 1)
+    display["Tag"] = display["player_name"].apply(
+        lambda n: "⭐" if n in st.session_state.targets
+                  else ("❌" if n in st.session_state.avoid_list else "")
+    )
+    drafted_ids = state.drafted_ids()
+    display["Status"] = display["player_id"].apply(
+        lambda pid: "✅ Drafted" if pid in drafted_ids else ""
+    )
 
     prev_col = next((c for c in display.columns if c.startswith("fpts_")), None)
+    exp_col  = "years_of_experience" if "years_of_experience" in display.columns else None
     display_cols = {
-        "player_name":           "Player",
-        "position":              "Pos",
-        "adp_rank":              "ADP",
-        "years_of_experience":   "Exp",
-        "projected_fpts":        "Proj Pts",
+        "Rank":             "Rank",
+        "Tag":              "Tag",
+        "player_name":      "Player",
+        "position":         "Pos",
+        "adp_rank":         "ADP",
+        **({"years_of_experience": "Exp"} if exp_col else {}),
+        "projected_fpts":   "Proj Pts",
         **(  {prev_col: f"{prev_col[5:]} Actual"} if prev_col else {}),
-        "auction_value":         "Pre-Draft $",
-        "repriced_value":        "Current $",
-        "ppg":                   "Recent PPG",
-        "seasons":               "Data Yrs",
+        "auction_value":    "Pre-Draft $",
+        "repriced_value":   "Current $",
+        "ppg":              "Recent PPG",
+        "Status":           "Status",
     }
     show = (
         display[[c for c in display_cols if c in display.columns]]
         .rename(columns=display_cols)
-        .reset_index(drop=True)    # positional index must match st.dataframe row numbers
+        .reset_index(drop=True)
     )
     for col in ["Proj Pts", f"{prev_col[5:]} Actual" if prev_col else ""]:
         if col in show.columns:
             show[col] = show[col].round(1)
 
-    st.caption("Click any player row to open their profile.")
+    # Budget summary line
+    total_board_value = display["auction_value"].sum()
+    total_league_budget = num_teams * budget
+    st.caption(
+        f"Showing {len(show)} players · Total projected value: "
+        f"**${total_board_value:,.0f}** vs league budget **${total_league_budget:,}**  "
+        f"· Click any row to open Player Profile"
+    )
 
     board_event = st.dataframe(
         show,
@@ -389,6 +524,20 @@ with tab_board:
             fig.update_layout(xaxis_tickangle=-45)
             st.plotly_chart(fig, use_container_width=True)
 
+    # Valuation method explanation (Task 7)
+    with st.expander("ℹ️ How are values calculated?"):
+        st.markdown("""
+**Pre-Draft $** is sourced directly from DraftSharks auction values (PPR, 12-team, $200 budget).
+For players not in DraftSharks the value uses a Points-Above-Replacement (PAR) model:
+
+1. **Bayesian projection** — past PPG is shrunk toward a position average using `w = games / (games + 8)`.
+   Rookies use the positional average as a prior.
+2. **PAR** — subtract replacement-level production (top 36 QB, 60 RB, 60 WR, 24 TE available) to get surplus value.
+3. **Auction conversion** — PAR surplus is scaled so the total budget pool (budget × teams) is fully allocated.
+4. **Live repricing** — once picks are recorded, each position's factor (actual ÷ projected median) adjusts
+   remaining values; a global budget factor shrinks/inflates all values proportionally.
+        """)
+
 # ─── Tab 2: Live Draft Input ──────────────────────────────────────────────────
 
 with tab_live:
@@ -397,22 +546,24 @@ with tab_live:
     if repriced is None:
         st.info("Load projections first (sidebar).")
     else:
-        available = repriced[~repriced["player_id"].isin(state.drafted_ids())]
+        available = reprice(projections_display, state, exclude_drafted=False)
+        avail_undrafted = available[~available["player_id"].isin(state.drafted_ids())]
 
         with st.form("record_pick"):
             st.subheader("Record a Pick")
             col1, col2, col3 = st.columns(3)
             with col1:
-                player_options = available["player_name"].tolist()
+                player_options = avail_undrafted["player_name"].tolist()
                 selected_player = st.selectbox("Player", options=player_options)
             with col2:
-                winning_team = st.text_input("Winning Team (name)", placeholder="e.g. Team Alpha")
+                # Task 3: owner dropdown
+                winning_team = st.selectbox("Winning Team", options=OWNERS)
             with col3:
                 price_paid = st.number_input("Price Paid ($)", min_value=1, max_value=500, value=1)
 
             submitted = st.form_submit_button("✅ Record Pick")
             if submitted and selected_player and winning_team:
-                row = available[available["player_name"] == selected_player].iloc[0]
+                row = avail_undrafted[avail_undrafted["player_name"] == selected_player].iloc[0]
                 pick = DraftResult(
                     player_id=str(row["player_id"]),
                     player_name=selected_player,
@@ -422,7 +573,51 @@ with tab_live:
                     projected_value=float(row["auction_value"]),
                 )
                 state.record_pick(pick)
-                st.success(f"Recorded: {selected_player} -> {winning_team} for ${price_paid}")
+                st.success(f"Recorded: {selected_player} → {winning_team} for ${price_paid}")
+
+        # ── Task 1 & 2: Manage existing picks ────────────────────────────────
+        if state.results:
+            st.subheader("Manage Picks")
+            picks_df = state.picks_df()
+            picks_df["#"] = range(1, len(picks_df) + 1)
+            st.dataframe(
+                picks_df[["#", "player_name", "position", "team", "actual_price"]].rename(
+                    columns={"player_name": "Player", "position": "Pos",
+                             "team": "Owner", "actual_price": "$ Paid"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+                height=250,
+            )
+
+            mgmt_c1, mgmt_c2 = st.columns(2)
+
+            with mgmt_c1:
+                with st.form("delete_pick_form"):
+                    st.caption("**Delete a pick**")
+                    del_options = [f"{r.player_name} (${r.actual_price:.0f})" for r in state.results]
+                    del_choice  = st.selectbox("Select pick to delete", options=del_options, key="del_pick")
+                    del_submit  = st.form_submit_button("🗑️ Delete Pick")
+                    if del_submit:
+                        idx = del_options.index(del_choice)
+                        pid = state.results[idx].player_id
+                        state.delete_pick(pid)
+                        st.success(f"Deleted: {del_choice}")
+                        st.rerun()
+
+            with mgmt_c2:
+                with st.form("edit_pick_form"):
+                    st.caption("**Correct a price**")
+                    edit_options = [f"{r.player_name} (${r.actual_price:.0f})" for r in state.results]
+                    edit_choice  = st.selectbox("Select pick to edit", options=edit_options, key="edit_pick")
+                    new_price    = st.number_input("New price ($)", min_value=1, max_value=500, value=1)
+                    edit_submit  = st.form_submit_button("✏️ Update Price")
+                    if edit_submit:
+                        idx = edit_options.index(edit_choice)
+                        pid = state.results[idx].player_id
+                        state.edit_pick_price(pid, float(new_price))
+                        st.success(f"Updated {edit_choice} → ${new_price}")
+                        st.rerun()
 
         st.subheader("Position Market Trends")
         mkt = position_market_summary(state)
@@ -475,6 +670,48 @@ with tab_teams:
                 ]
                 st.dataframe(pd.DataFrame(pick_rows), use_container_width=True)
 
+    # ── Tasks 11 & 12: My Budget Tracker ─────────────────────────────────────
+    st.divider()
+    st.subheader("My Budget Plan")
+    st.caption("Enter target MIN/MAX spend per slot. ACTUAL is filled from picks recorded to 'Me'.")
+
+    my_picks = state.team_rosters.get("Me", [])
+
+    # Group my picks by position (assign to slots in order)
+    pos_spend: dict[str, list[float]] = {}
+    for p in my_picks:
+        pos_spend.setdefault(p.position, []).append(p.actual_price)
+
+    plan_rows = []
+    for slot, (lo, hi) in DEFAULT_BUDGET_PLAN.items():
+        # Derive base position from slot name (e.g. "RB1" → "RB")
+        base_pos = "".join(c for c in slot if c.isalpha()).rstrip("12345").replace("/", "")
+        actual = None
+        if base_pos in pos_spend and pos_spend[base_pos]:
+            actual = pos_spend[base_pos].pop(0)
+
+        plan_rows.append({
+            "Slot":   slot,
+            "MIN $":  lo,
+            "MAX $":  hi,
+            "ACTUAL": f"${actual:.0f}" if actual is not None else "—",
+            "vs MIN": ("✅" if actual and actual >= lo else ("⚠️ Low" if actual else "")) ,
+            "vs MAX": ("⚠️ Over" if actual and actual > hi else ("✅" if actual else "")),
+        })
+
+    # Totals
+    starters = {k: v for k, v in DEFAULT_BUDGET_PLAN.items()
+                if k not in ("RB3","RB4","RB5","WR4","WR5","QB2","RB/WR","RB/WR (2)")}
+    bench    = {k: v for k, v in DEFAULT_BUDGET_PLAN.items() if k not in starters}
+    total_lo = sum(v[0] for v in DEFAULT_BUDGET_PLAN.values())
+    total_hi = sum(v[1] for v in DEFAULT_BUDGET_PLAN.values())
+    total_actual = sum(p.actual_price for p in my_picks)
+    plan_rows.append({"Slot": "─── Total ───", "MIN $": total_lo, "MAX $": total_hi,
+                      "ACTUAL": f"${total_actual:.0f}" if my_picks else "—", "vs MIN": "", "vs MAX": ""})
+
+    plan_df = pd.DataFrame(plan_rows)
+    st.dataframe(plan_df, use_container_width=True, hide_index=True)
+
 # ─── Tab 4: Results / Analysis ────────────────────────────────────────────────
 
 with tab_results:
@@ -519,10 +756,10 @@ with tab_player:
     if repriced is None:
         st.info("Load projections first (sidebar).")
     else:
-        skill = repriced[repriced["position"].isin(["QB", "RB", "WR", "TE", "K", "DST"])].copy()
+        all_for_profile = reprice(projections_display, state, exclude_drafted=False)
+        skill = all_for_profile[all_for_profile["position"].isin(["QB", "RB", "WR", "TE", "K", "DST"])].copy()
         player_names = skill.sort_values("auction_value", ascending=False)["player_name"].tolist()
 
-        # Default to whatever was clicked in the board (if anything)
         default_name = st.session_state.get("profile_player") or player_names[0]
         default_idx  = player_names.index(default_name) if default_name in player_names else 0
 
@@ -531,15 +768,11 @@ with tab_player:
             options=player_names,
             index=default_idx,
         )
-        # Keep session state in sync with manual selectbox changes
         st.session_state.profile_player = selected
 
-        render_player_panel(selected, repriced, schedule_df, ppr, STATS_PATH)
+        render_player_panel(selected, all_for_profile, schedule_df, ppr, STATS_PATH)
 
 # ─── Tab navigation: JS click ─────────────────────────────────────────────────
-# Runs OUTSIDE all tabs so the component always renders.
-# When a board row is selected, clicks the Player Profile tab (index 4) in the
-# parent document. Uses a retry loop in case the DOM hasn't settled yet.
 
 if st.session_state.get("nav_to_profile"):
     st.session_state.nav_to_profile = False

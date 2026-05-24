@@ -52,6 +52,36 @@ class AuctionState:
             return pd.DataFrame()
         return pd.DataFrame([vars(r) for r in self.results])
 
+    def _rebuild_state(self):
+        """Recompute team_budgets and team_rosters from self.results."""
+        self.team_budgets = {}
+        self.team_rosters = {}
+        for pick in self.results:
+            if pick.team not in self.team_budgets:
+                self.team_budgets[pick.team] = self.budget
+            self.team_budgets[pick.team] -= pick.actual_price
+            if pick.team not in self.team_rosters:
+                self.team_rosters[pick.team] = []
+            self.team_rosters[pick.team].append(pick)
+
+    def delete_pick(self, player_id: str) -> bool:
+        """Remove a pick by player_id; returns True if found."""
+        before = len(self.results)
+        self.results = [r for r in self.results if r.player_id != player_id]
+        if len(self.results) == before:
+            return False
+        self._rebuild_state()
+        return True
+
+    def edit_pick_price(self, player_id: str, new_price: float) -> bool:
+        """Update the price of an existing pick; returns True if found."""
+        for r in self.results:
+            if r.player_id == player_id:
+                r.actual_price = new_price
+                self._rebuild_state()
+                return True
+        return False
+
 
 # ─── Repricing ────────────────────────────────────────────────────────────────
 
@@ -85,6 +115,7 @@ def reprice(
     projections: pd.DataFrame,
     state: AuctionState,
     remaining_budget_adjustment: bool = True,
+    exclude_drafted: bool = True,
 ) -> pd.DataFrame:
     """
     Adjust projected auction values for all unsold players.
@@ -93,11 +124,11 @@ def reprice(
     1. Apply per-position discount/premium from results so far.
     2. Optionally scale for remaining budget (if teams are running low overall).
 
-    Returns a copy of projections with updated 'repriced_value' column,
-    excluding already-drafted players.
+    Returns a copy of projections with updated 'repriced_value' column.
+    Pass exclude_drafted=False to include already-drafted players (e.g. for board display).
     """
     drafted = state.drafted_ids()
-    df = projections[~projections["player_id"].isin(drafted)].copy()
+    df = projections[~projections["player_id"].isin(drafted)].copy() if exclude_drafted else projections.copy()
 
     if df.empty:
         return df
