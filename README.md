@@ -58,8 +58,12 @@ Teams and budget are adjustable in the dashboard sidebar. Roster composition is 
 - **Auction values + ADP:** **DraftSharks** CSV exports (requires a paid account — see
   [Setup](#setup)). Pulls DS auction value, market auction value, ADP, DS/consensus projections,
   floor/ceiling, injury risk, and strength of schedule.
-- **Fallback:** if the DraftSharks login or export fails, `fetch_all_adp()` scrapes free
-  FantasyPros ADP instead, and the engine derives values from a position-rank log curve.
+- **Team defenses:** DraftSharks' *auction-values* export contains no defenses, so all 32 come
+  from the *rankings* export and are appended separately (`_draftsharks_defenses`).
+- **Fallback (currently broken):** `fetch_all_adp()` scrapes free FantasyPros ADP if DraftSharks
+  fails, but FantasyPros is now JS-rendered — the table parser finds nothing, and only the top 5
+  rows are even present in the page source. Treat DraftSharks as the only working value source
+  until this is rewritten. The committed CSVs mean a broken fetch never breaks the dashboard.
 
 ### 2. Fantasy Points
 Each player-season is scored under the league's custom settings. The PPR multiplier (0, 0.5, 1.0)
@@ -118,8 +122,21 @@ like an average rookie at their position.
    (rookies, name mismatches) is added with their expert value and a rookie-prior point estimate.
 
 > **In practice:** the dashboard overwrites `auction_value` with the raw DraftSharks value wherever
-> one exists (~488 of 998 players), so the PAR model mainly drives **Proj Pts**, the reprice
+> one exists (~488 of 1,001 players), so the PAR model mainly drives **Proj Pts**, the reprice
 > baseline, and the values for players DraftSharks doesn't rank.
+
+### 4b. Kickers and Defenses
+Neither goes through the PAR model — we don't score kicking, and the league's DST scoring rules
+were never defined, so projecting either would be invention. Both are taken from the expert export
+instead:
+
+| Position | Count | Value source |
+|---|---|---|
+| K | 39 | DraftSharks dollar values (Aubrey $6 down to $1) |
+| DST | 32 | Position-rank log curve, $3 for DST1 down to $1 |
+
+Defenses show **Proj Pts** blank rather than 0 — DraftSharks' own DST projection is carried through
+as a column so you can still rank them, alongside ADP, bye, and SOS.
 
 ### 5. Repricing — Live Draft ([reprice_engine.py](reprice_engine.py))
 - Every recorded pick stores actual price vs. the value we had projected.
@@ -161,15 +178,17 @@ fantasy_auction/
 ├── .env                     # DraftSharks credentials (gitignored — see Setup)
 ├── pyrightconfig.json       # Pylance/Pyright path resolution for the IDE
 ├── webscraping.py           # Stats, players, schedule (nfl_data_py) + DraftSharks/FantasyPros
-├── projection_engine.py     # Bayesian projections + PAR auction values + ADP blend
+├── projection_engine.py     # Bayesian projections + PAR auction values + ADP blend + K/DST
 ├── backtest.py              # Tests projection accuracy on held-out seasons
 ├── reprice_engine.py        # Live-draft auction state + repricing logic
+├── session_store.py         # Save/restore the live draft session (JSON)
 ├── data/                    # Raw and processed CSVs (committed so the deployed app has data)
 │   ├── seasonal_stats.csv   # Historical player stats 2014–2025 (6,681 rows)
 │   ├── players.csv          # Player metadata: age, headshot, team (8,725 rows)
-│   ├── adp.csv              # DraftSharks auction values + ADP (524 rows)
+│   ├── adp.csv              # DraftSharks auction values + ADP + defenses (552 rows)
 │   ├── schedule.csv         # 2026 regular-season schedule
-│   ├── projections.csv      # Engine output (998 players)
+│   ├── projections.csv      # Engine output (1,001 players incl. 39 K, 32 DST)
+│   ├── draft_state.json     # Autosaved live draft (gitignored)
 │   └── backtest_results.csv # Backtest detail (gitignored)
 └── dashboard/
     └── app.py               # Streamlit frontend (5 tabs)
@@ -232,11 +251,26 @@ Opens at `http://localhost:8501`.
 
 **Sidebar** — PPR format, number of teams, budget per team, projection season.
 **Load / Refresh Projections** reads `data/projections.csv` if present, otherwise runs the engine
-live. **Reset Auction** clears all recorded picks.
+live. **Reset Auction** clears all recorded picks (after copying the current save to
+`draft_state.backup.json`).
+
+### 💾 Draft State — your work survives a refresh
+Picks, tags, notes, and budget edits are saved automatically to `data/draft_state.json` after every
+change, and reloaded when you open the app. A refresh, a closed laptop, or a crashed browser costs
+you nothing.
+
+Two independent safety nets, because they fail in different situations:
+- **Autosave** — writes to disk. Works locally; on Streamlit Cloud a container restart wipes it, and
+  a read-only filesystem blocks it entirely. The sidebar caption tells you which state you're in.
+- **⬇️ Download draft state / ⬆️ Restore from file** — a JSON file you keep. Works everywhere and
+  survives anything. **Before draft day, click Download once so you know where the button is.**
+
+If the save file is ever unreadable, the app says so, turns autosave *off* rather than overwriting
+it, and keeps running — restore from a download instead.
 
 ### 📋 Player Board
-Every rostered-caliber player, ranked by current value. Filter by position, max price, drafted
-status, or tag (⭐ target / ❌ avoid). The **Rank** column is the board's own ordering; **ADP** is
+Every rostered-caliber player, ranked by current value. Filter by position (including K and DST),
+max price, drafted status, or tag (⭐ target / ❌ avoid). The **Rank** column is the board's own ordering; **ADP** is
 the DraftSharks rank, so the two can be compared side by side. **Click any row to jump to that
 player's profile.** The caption shows total board value vs. total league budget as a sanity check.
 
@@ -258,11 +292,8 @@ break-even line.
 ### 🏈 Player Profile
 Headshot, ADP, DS value, market value, projected points, injury risk, bye week; target/avoid
 buttons; a free-text notes field; the player's 2026 schedule with bye highlighted; and a
-season-by-season stat table and fpts/PPG chart.
-
-> ⚠️ **Draft state lives in the browser session.** Picks, tags, notes, and budget edits are held in
-> Streamlit session state — refreshing the page or losing the connection clears them. Keep the tab
-> open for the whole auction, and keep a paper backup of picks.
+season-by-season stat table and fpts/PPG chart. Tags and notes added here are saved with the rest
+of the draft state.
 
 ---
 
@@ -282,11 +313,11 @@ Because `data/` is committed, refreshing data for the deployed app means re-runn
 
 ## Known Limitations
 
-- **DST is not in the pipeline.** DraftSharks' export contains no team-defense rows, so no DST
-  players reach `projections.csv`. Draft them off your own board.
-- **Kickers are expert-value only.** K rows carry a DraftSharks value but no projected points; the
-  stat model doesn't score kicking.
-- **No persistence.** See the session-state warning above.
+- **K and DST are expert-value only.** Both are on the board with values, ADP, and byes, but
+  neither has a points projection from this repo's model — see [4b](#4b-kickers-and-defenses).
+  DST dollar values are rank-derived, not a DraftSharks number.
+- **Autosave is per-machine.** The save file lives next to the data, so opening the dashboard on a
+  different computer starts empty. Move a draft between machines with Download → Restore.
 - **Turnover scoring assumed.** INT and fumble-lost are −2 each; confirm against league rules.
 - **Two-source values.** Where DraftSharks covers a player their number wins outright, so board
   values are only as good as DraftSharks' model. This repo's PAR model is the check on it — a big
@@ -302,8 +333,8 @@ Because `data/` is committed, refreshing data for the deployed app means re-runn
 | Source | Data | Cost |
 |---|---|---|
 | [nfl_data_py / nflverse](https://github.com/nflverse/nfl_data_py) | Player stats 2014–2025, metadata, schedules | Free |
-| [DraftSharks](https://www.draftsharks.com/auction-values/ppr) | Auction values, market values, ADP, projections, injury risk | Paid account |
-| [FantasyPros](https://www.fantasypros.com/nfl/adp/ppr-overall.php) | ADP (fallback only) | Free |
+| [DraftSharks](https://www.draftsharks.com/auction-values/ppr) | Auction values, market values, ADP, projections, injury risk, defenses | Paid account |
+| [FantasyPros](https://www.fantasypros.com/nfl/adp/ppr-overall.php) | ADP — fallback, **scraper broken** (site is JS-rendered) | Free |
 
 FantasyData (the source originally listed in CLAUDE.md) was dropped — its stat and ADP pages are
 paywalled.

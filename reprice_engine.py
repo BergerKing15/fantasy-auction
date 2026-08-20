@@ -82,6 +82,38 @@ class AuctionState:
                 return True
         return False
 
+    # ── Serialization (used by session_store for save/restore) ────────────────
+
+    def to_dict(self) -> dict:
+        """Plain-dict form suitable for JSON. Budgets/rosters are derived, so
+        only the picks themselves are stored."""
+        return {
+            "teams":   self.teams,
+            "budget":  self.budget,
+            "results": [vars(r) for r in self.results],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AuctionState":
+        """Rebuild an AuctionState from to_dict() output."""
+        state = cls(
+            teams=int(data.get("teams", 12)),
+            budget=float(data.get("budget", 200.0)),
+        )
+        state.results = [
+            DraftResult(
+                player_id=str(p["player_id"]),
+                player_name=str(p["player_name"]),
+                position=str(p["position"]),
+                team=str(p["team"]),
+                actual_price=float(p["actual_price"]),
+                projected_value=float(p["projected_value"]),
+            )
+            for p in data.get("results", [])
+        ]
+        state._rebuild_state()
+        return state
+
 
 # ─── Repricing ────────────────────────────────────────────────────────────────
 

@@ -160,6 +160,108 @@ def blend_adp(result: pd.DataFrame, adp_path: str,
     return df
 
 
+# ─── K / DST ──────────────────────────────────────────────────────────────────
+
+# Columns worth carrying onto the board for K and DST rows, if the export has them
+_KD_PASSTHROUGH = [
+    "ds_proj", "consensus_proj", "floor_proj", "ceiling_proj",
+    "injury_risk", "sos", "ds_auction_value", "market_auction_value",
+    "Team", "Bye",
+]
+
+
+def _special_position_rows(adp_path: str) -> pd.DataFrame:
+    """
+    Build kicker and team-defense board rows from the expert export.
+
+    Neither position goes through the PAR model: we don't score kicking, and the
+    league's DST scoring rules were never defined, so projecting either would be
+    invention. Values come straight from the export instead —
+
+      K   : DraftSharks publishes real dollar values, so use them.
+      DST : DraftSharks publishes none, so price off position rank via the
+            log curve ($3 for DST1 down to $1), which is where defenses
+            actually land in an auction.
+    """
+    if not os.path.exists(adp_path):
+        return pd.DataFrame()
+
+    adp = pd.read_csv(adp_path)
+    if "position" in adp.columns:
+        sel = adp[adp["position"].astype(str).str.upper().isin(["K", "DST", "DEF"])].copy()
+        sel["position"] = sel["position"].str.upper().replace({"DEF": "DST"})
+    elif "POS" in adp.columns:   # legacy FantasyPros-format file
+        sel = adp[adp["POS"].astype(str).str.match(r"^(K|D)", na=False)].copy()
+        sel["position"] = np.where(sel["POS"].str.startswith("K"), "K", "DST")
+    else:
+        return pd.DataFrame()
+
+    if sel.empty:
+        return pd.DataFrame()
+
+    if "Player" in sel.columns:
+        sel["player_name"] = sel["Player"].astype(str).str.strip()
+    else:
+        sel["player_name"] = sel["PlayerTeam (Bye)"].apply(_clean_adp_name).str.title()
+    sel = sel.drop_duplicates(subset=["position", "player_name"])
+
+    # Position rank: prefer the digits in "K12"/"DST3", else rank by overall Rank
+    if "POS" in sel.columns:
+        sel["pos_rank"] = pd.to_numeric(
+            sel["POS"].astype(str).str.extract(r"(\d+)$")[0], errors="coerce"
+        )
+    else:
+        sel["pos_rank"] = np.nan
+    fallback_rank = sel.groupby("position")["Rank"].rank(method="first") if "Rank" in sel.columns else 1
+    sel["pos_rank"] = sel["pos_rank"].fillna(fallback_rank).fillna(1).astype(int)
+
+    curve = pd.Series(
+        [_pos_adp_value(p, r) for p, r in zip(sel["position"], sel["pos_rank"])],
+        index=sel.index,
+    )
+    ds_val = (
+        pd.to_numeric(sel["ds_auction_value"], errors="coerce")
+        if "ds_auction_value" in sel.columns else pd.Series(np.nan, index=sel.index)
+    )
+    sel["auction_value"] = ds_val.where(ds_val > 0).fillna(curve).round(1)
+
+    sel["player_id"] = (
+        sel["position"].str.lower() + "_" +
+        sel["player_name"].str.lower().str.replace(r"[^a-z0-9]+", "_", regex=True)
+    )
+    sel["adp_rank"] = pd.to_numeric(sel.get("Rank"), errors="coerce")
+
+    # No point projection for these positions — leave blank rather than fake a 0.
+    # float NaN (not pd.NA) keeps the columns numeric through the concat in run().
+    sel["projected_fpts"]  = float("nan")
+    sel["ppg"]             = float("nan")
+    sel["par"]             = 0.0
+    sel["replacement_pts"] = 0.0
+
+    cols = ["player_id", "player_name", "position", "auction_value", "adp_rank",
+            "projected_fpts", "ppg", "par", "replacement_pts"]
+    cols += [c for c in _KD_PASSTHROUGH if c in sel.columns]
+    return sel[cols].reset_index(drop=True)
+
+
+def _kickers_from_players(players: pd.DataFrame) -> pd.DataFrame:
+    """Fallback kicker list from players.csv when the expert export has none."""
+    k = players[players["position"] == "K"].copy()
+    if "last_season" in k.columns:
+        k = k[k["last_season"] >= 2024]
+    if k.empty:
+        return pd.DataFrame()
+    out = k[["gsis_id", "display_name"]].copy()
+    out.columns = ["player_id", "player_name"]
+    out["position"]        = "K"
+    out["auction_value"]   = 1.0
+    out["projected_fpts"]  = float("nan")
+    out["ppg"]             = float("nan")
+    out["par"]             = 0.0
+    out["replacement_pts"] = 0.0
+    return out
+
+
 # ─── Fantasy Points ────────────────────────────────────────────────────────────
 
 def compute_fantasy_points(df: pd.DataFrame, ppr: float = 1.0) -> pd.Series:
@@ -563,37 +665,11 @@ def run(ppr: float = 1.0, projection_season: int = 2026) -> pd.DataFrame:
         prev_totals.columns = ["player_id", f"fpts_{prev_season}"]
         result = result.merge(prev_totals, on="player_id", how="left")
 
-    # Add K and DST rows — not projected via PAR, all valued at $1
-    kd_rows = []
-
-    # Kickers: from players.csv (position == "K"), filter to recently active
-    if not players.empty and "position" in players.columns:
-        k_all = players[players["position"] == "K"].copy()
-        if "last_season" in k_all.columns:
-            k_all = k_all[k_all["last_season"] >= 2024]
-        k_players = k_all[["gsis_id", "display_name"]].copy()
-        k_players.columns = ["player_id", "player_name"]
-        k_players["position"] = "K"
-        kd_rows.append(k_players)
-
-    # DST: from adp.csv
-    adp_path = os.path.join(DATA_DIR, "adp.csv")
-    if os.path.exists(adp_path):
-        adp = pd.read_csv(adp_path)
-        dst = adp[adp["scoring_format"] == "dst"].copy()
-        if dst.empty:
-            dst = adp[adp["POS"].str.startswith("D", na=False)].drop_duplicates("PlayerTeam (Bye)")
-        dst["player_name"] = dst["PlayerTeam (Bye)"].str.replace(r"\(.*\)", "", regex=True).str.strip()
-        dst["position"] = "DST"
-        dst["player_id"] = "dst_" + dst["player_name"].str.lower().str.replace(" ", "_")
-        kd_rows.append(dst[["player_id", "player_name", "position"]])
-
-    if kd_rows:
-        kd = pd.concat(kd_rows, ignore_index=True)
-        kd["auction_value"]   = 1.0
-        kd["projected_fpts"]  = 0.0
-        kd["par"]             = 0.0
-        kd["replacement_pts"] = 0.0
+    # Add K and DST rows from the expert export (see _special_position_rows)
+    kd = _special_position_rows(adp_path)
+    if kd.empty and not players.empty and "position" in players.columns:
+        kd = _kickers_from_players(players)   # last resort if adp.csv has no K/DST
+    if not kd.empty:
         result = pd.concat([result, kd], ignore_index=True)
 
     try:

@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import session_store
 from projection_engine import run as run_projections, compute_fantasy_points
 from reprice_engine import AuctionState, DraftResult, reprice, position_market_summary
 
@@ -316,6 +317,67 @@ if "player_comments" not in st.session_state:
 if "budget_plan" not in st.session_state:
     st.session_state.budget_plan = {k: list(v) for k, v in DEFAULT_BUDGET_PLAN.items()}
 
+# ─── Draft State Persistence ──────────────────────────────────────────────────
+
+DRAFT_STATE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "draft_state.json")
+
+
+def current_snapshot() -> dict:
+    """Snapshot everything the user would hate to re-enter."""
+    return session_store.build_snapshot(
+        st.session_state.auction_state,
+        st.session_state.targets,
+        st.session_state.avoid_list,
+        st.session_state.player_comments,
+        st.session_state.budget_plan,
+    )
+
+
+def apply_snapshot(snap: dict) -> None:
+    """Load a snapshot into the live session."""
+    st.session_state.auction_state   = AuctionState.from_dict(snap["auction"])
+    st.session_state.targets         = set(snap.get("targets", []))
+    st.session_state.avoid_list      = set(snap.get("avoid", []))
+    st.session_state.player_comments = dict(snap.get("comments", {}))
+    if snap.get("budget_plan"):
+        st.session_state.budget_plan = {k: list(v) for k, v in snap["budget_plan"].items()}
+    # The data_editor caches its own edits under this key and would otherwise
+    # re-apply them over the restored plan
+    st.session_state.pop("budget_plan_editor", None)
+
+
+def autosave() -> None:
+    """Persist the session after every change. Skipped when nothing changed, and
+    disabled if the last read found a file we couldn't parse (don't clobber it)."""
+    if not st.session_state.get("autosave_ok", True):
+        return
+    snap = current_snapshot()
+    payload = session_store.snapshot_to_json(snap)
+    if payload == st.session_state.get("_last_saved"):
+        return
+    if session_store.save_snapshot(DRAFT_STATE_PATH, snap):
+        st.session_state._last_saved = payload
+        st.session_state.autosave_writable = True
+    else:
+        st.session_state.autosave_writable = False   # read-only fs (e.g. Cloud)
+
+
+# Restore a previous session once per browser session, before anything renders
+if "_restore_checked" not in st.session_state:
+    st.session_state._restore_checked = True
+    try:
+        _saved = session_store.load_snapshot(DRAFT_STATE_PATH)
+        if _saved:
+            apply_snapshot(_saved)
+            st.session_state.restore_notice = (
+                f"Restored previous session — {session_store.describe_picks(_saved)}."
+            )
+            st.session_state._last_saved = session_store.snapshot_to_json(_saved)
+    except ValueError as exc:
+        # Unreadable save file: warn and stop autosaving so it isn't overwritten
+        st.session_state.autosave_ok = False
+        st.session_state.restore_error = str(exc)
+
 # ─── Sidebar: Settings ────────────────────────────────────────────────────────
 
 st.sidebar.title("⚙️ Settings")
@@ -349,8 +411,57 @@ if st.sidebar.button("🔄 Load / Refresh Projections"):
 
 st.sidebar.divider()
 if st.sidebar.button("🗑️ Reset Auction"):
+    backup = session_store.backup_existing(DRAFT_STATE_PATH)   # never wipe without a copy
     st.session_state.auction_state = AuctionState(teams=num_teams, budget=float(budget))
-    st.sidebar.success("Auction state cleared.")
+    st.sidebar.success(
+        "Auction state cleared." + (f" Backup: `{os.path.basename(backup)}`" if backup else "")
+    )
+
+# ─── Sidebar: Save / Restore ──────────────────────────────────────────────────
+
+st.sidebar.divider()
+st.sidebar.subheader("💾 Draft State")
+
+_notice = st.session_state.pop("restore_notice", None)
+if _notice:
+    st.sidebar.info(_notice)
+if st.session_state.get("restore_error"):
+    st.sidebar.warning(
+        f"Couldn't read the saved draft: {st.session_state.restore_error}\n\n"
+        "Autosave is off so the file stays intact. Restore from a download instead."
+    )
+
+_n_picks = len(st.session_state.auction_state.results)
+if not st.session_state.get("autosave_ok", True):
+    st.sidebar.caption("⚠️ Autosave off — download to save your work.")
+elif st.session_state.get("autosave_writable", True):
+    st.sidebar.caption(f"✅ Autosaving {_n_picks} picks to `data/draft_state.json`")
+else:
+    st.sidebar.caption("⚠️ Can't write to disk here — use Download to save your work.")
+
+st.sidebar.download_button(
+    "⬇️ Download draft state",
+    data=session_store.snapshot_to_json(current_snapshot()),
+    file_name="draft_state.json",
+    mime="application/json",
+    use_container_width=True,
+)
+
+_upload = st.sidebar.file_uploader("⬆️ Restore from file", type="json", key="restore_upload")
+if _upload is not None:
+    _uid = getattr(_upload, "file_id", _upload.name)
+    if st.session_state.get("_restored_upload_id") != _uid:
+        try:
+            _snap = session_store.parse_snapshot(_upload.getvalue())
+            apply_snapshot(_snap)
+            st.session_state._restored_upload_id = _uid
+            st.session_state.autosave_ok = True   # a good file supersedes a bad one
+            st.session_state.pop("restore_error", None)
+            st.sidebar.success(f"Restored — {session_store.describe_picks(_snap)}.")
+            st.rerun()
+        except ValueError as exc:
+            st.session_state._restored_upload_id = _uid
+            st.sidebar.error(f"Couldn't restore: {exc}")
 
 # ─── Auto-load projections on first visit ─────────────────────────────────────
 
@@ -379,21 +490,8 @@ if projections is not None:
                 projections_display["player_name"].map(mav_map)
             )
 
-        # Bring in K from adp.csv since projection engine doesn't populate them
-        k_rows = adp_raw[adp_raw["position"] == "K"].copy()
-        if not k_rows.empty:
-            k_rows = k_rows.rename(columns={"Player": "player_name", "Rank": "adp_rank"})
-            k_rows["position"]             = "K"
-            k_rows["auction_value"]        = k_rows["ds_auction_value"].fillna(1.0)
-            k_rows["repriced_value"]       = k_rows["auction_value"]
-            k_rows["player_id"]            = "adp_k_" + k_rows["player_name"].str.replace(" ", "_")
-            k_rows["projected_fpts"]       = pd.NA
-            k_rows["ppg"]                  = pd.NA
-            k_rows["seasons"]              = pd.NA
-            existing_k = set(projections_display[projections_display["position"] == "K"]["player_name"])
-            new_k = k_rows[~k_rows["player_name"].isin(existing_k)]
-            if not new_k.empty:
-                projections_display = pd.concat([projections_display, new_k], ignore_index=True)
+        # K and DST now come from projection_engine._special_position_rows(),
+        # which sources both from this same export — nothing to inject here.
 else:
     projections_display = projections
 
@@ -434,7 +532,9 @@ with tab_board:
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         pos_filter = st.multiselect(
-            "Position", options=["QB", "RB", "WR", "TE", "K"], default=["QB", "RB", "WR", "TE"]
+            "Position",
+            options=["QB", "RB", "WR", "TE", "K", "DST"],
+            default=["QB", "RB", "WR", "TE"],
         )
     with col2:
         max_price = st.number_input("Max $ Value (filter)", min_value=1, max_value=300, value=200)
@@ -831,6 +931,11 @@ with tab_player:
         st.session_state.profile_player = selected
 
         render_player_panel(selected, all_for_profile, schedule_df, ppr, STATS_PATH)
+
+# ─── Autosave ─────────────────────────────────────────────────────────────────
+# Last thing each run, so it captures every mutation the tabs above made.
+
+autosave()
 
 # ─── Tab navigation: JS click ─────────────────────────────────────────────────
 

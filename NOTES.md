@@ -4,6 +4,55 @@ Context-recovery notes for Claude Code. Newest session at the top.
 
 ---
 
+## 2026-08-20 — Fixed: missing DST, no persistence
+
+### DST — root cause was a silent merge drop, not a missing source
+DraftSharks' **rankings** export has all 32 team defenses (`Fantasy Position == "DEF"`), with DS
+projections, ADP, bye, and SOS. The **auction-values** export has none. `fetch_draftsharks_data()`
+started from auction values and *left*-merged rankings onto it, so every defense fell out without
+a word. `_draftsharks_defenses()` now appends them after the merge.
+
+Two dead ends worth not repeating:
+- **FantasyPros DST scrape** — the site is JS-rendered now. `_parse_fantasypros_adp()` (looks for
+  `<table id="data">`) is broken for *every* format, not just DST. The data sits in a JSON blob
+  under `"rows":[…]` in the page source, but only the top 5 rows are server-rendered; the rest
+  loads from an API. Not a viable free fallback anymore.
+- **`3D Value` column** — looks like dollars in the rankings export, isn't. It's a 0–100 scale
+  (corr 0.69 with DS auction value, mean abs diff ~$31). Don't treat it as a price.
+
+DraftSharks publishes no dollar value for defenses, so `_special_position_rows()` prices them off
+the rank curve: DST1 $3 → DST32 $1. That's where defenses actually go in an auction.
+
+Same function now sources **kickers** from the export too. Previously kickers came from
+players.csv — 66 rows all flat-priced at $1 — and the dashboard separately injected DS kickers
+*only if the name wasn't already there*, so every kicker DraftSharks actually priced kept its $1
+row and the real value never showed. Now: 39 kickers with real DS values (Aubrey $6). The
+dashboard-side injection block is deleted; both positions come from one place.
+
+`projections.csv`: 998 → 1,001 players (39 K + 32 DST, minus the 66 junk kickers).
+
+### Persistence — autosave + download, two nets
+`session_store.py` (Streamlit-free, so it's testable on its own) snapshots picks, tags, notes, and
+the budget plan to JSON. `AuctionState.to_dict()/from_dict()` handle the picks; budgets and rosters
+are derived on load, not stored.
+
+- Autosaves to `data/draft_state.json` at the end of every script run, skipping the write when
+  nothing changed. Atomic via `os.replace` so a crash mid-write can't truncate a good save.
+- Restores once per browser session, before anything renders.
+- Sidebar Download / Restore-from-file for Streamlit Cloud, where the filesystem may be read-only
+  or reset between container restarts.
+- **Corrupt save file → warn, turn autosave OFF, leave the file alone.** Never overwrite something
+  the user might still want to recover.
+- Reset Auction copies to `draft_state.backup.json` first.
+- On restore, `budget_plan_editor` is popped from session state — the `data_editor` caches its own
+  edits under that key and would otherwise re-apply them over the restored plan.
+
+Verified end-to-end with `streamlit.testing.v1.AppTest`: a second fresh session (= browser refresh)
+restored picks, targets, comments, and budget-plan edits; corrupt file warned without raising and
+left the file byte-intact; Reset backed up first; DST renders 32 rows on the board.
+
+---
+
 ## 2026-08-20 — Doc Sync (read-through, no code changes)
 
 Read the full codebase and brought README.md / NOTES.md back in line with what the code
@@ -118,12 +167,12 @@ editable MIN/MAX budget plan on the Teams tab.
 ## Open Items
 
 - [ ] Deploy to Streamlit Community Cloud (last step of CLAUDE.md task 9)
-- [ ] **DST missing entirely** — DraftSharks export has no team-defense rows, and the
-      `adp[POS startswith "D"]` fallback in `projection_engine.run()` finds nothing.
-      Needs a separate DST source or manual entry.
-- [ ] No persistence — a browser refresh mid-auction wipes picks/tags/notes. A JSON
-      save/load button on the Live Draft tab would be cheap insurance before draft day.
+- [x] ~~DST missing entirely~~ — fixed 2026-08-20, 32 defenses from the rankings export
+- [x] ~~No persistence~~ — fixed 2026-08-20, autosave + download/restore
 - [ ] `max_available = 2025` hardcoded in `project_players()` — bump when 2026 stats exist
-- [ ] Kickers have DS values but no projected points
+- [ ] K and DST have no points projection — values only. DST scoring rules were never
+      specified, so projecting them would be invention; ask the user for the rules.
+- [ ] `_parse_fantasypros_adp()` is dead code — the FantasyPros fallback can't work against
+      the JS-rendered site. Either drop it or rewrite against their API.
 - [ ] Confirm INT / fumble scoring against actual league rules
 - [ ] Profile-tab navigation depends on the hardcoded tab index 4 in the JS click handler

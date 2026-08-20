@@ -335,6 +335,48 @@ def _ds_login() -> requests.Session:
     return s
 
 
+def _draftsharks_defenses(rk_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract team-defense rows from the DraftSharks rankings export.
+
+    The auction-values export contains no defenses at all, so they only reach us
+    through the rankings export — which means a plain left-merge onto the auction
+    values silently drops all 32 of them. DraftSharks publishes no dollar value
+    for defenses either; projection_engine prices them off position rank.
+    """
+    if "Fantasy Position" not in rk_df.columns:
+        return pd.DataFrame()
+
+    dst = rk_df[
+        rk_df["Fantasy Position"].astype(str).str.upper().isin(["DEF", "DST", "D/ST"])
+    ].copy()
+    if dst.empty:
+        return pd.DataFrame()
+
+    dst = dst.sort_values("Rank").reset_index(drop=True)
+    dst["position"]  = "DST"
+    dst["pos_rank"]  = dst.index + 1
+    dst["POS"]       = "DST" + dst["pos_rank"].astype(str)
+    dst["PlayerTeam (Bye)"] = (
+        dst["Player"] + " " + dst["Team"].fillna("") +
+        "(" + dst["Bye"].astype(str) + ")"
+    )
+    dst["scoring_format"]       = "ppr"
+    # float NaN, not pd.NA — keeps these columns numeric through the concat below
+    dst["ds_auction_value"]     = float("nan")   # DraftSharks prices no defenses
+    dst["market_auction_value"] = float("nan")
+
+    return dst.rename(columns={
+        "ADP":            "ds_adp",
+        "DS Proj":        "ds_proj",
+        "Consensus Proj": "consensus_proj",
+        "Floor Proj":     "floor_proj",
+        "CeilingProj":    "ceiling_proj",
+        "InjuryRisk":     "injury_risk",
+        "SOS":            "sos",
+    })
+
+
 def fetch_draftsharks_data() -> pd.DataFrame:
     """
     Fetch PPR auction values and rankings from DraftSharks CSV exports.
@@ -343,6 +385,7 @@ def fetch_draftsharks_data() -> pd.DataFrame:
     Both dollar columns are preserved:
       - ds_auction_value   : DraftSharks' own PPR model value
       - market_auction_value: crowd-sourced auction market consensus
+    Team defenses are appended from the rankings export (see _draftsharks_defenses).
     Returns a DataFrame written to data/adp.csv.
     """
     print("Fetching DraftSharks PPR data...")
@@ -409,6 +452,17 @@ def fetch_draftsharks_data() -> pd.DataFrame:
         "injury_risk", "sos",
     ]
     result = result[[c for c in keep if c in result.columns]]
+
+    # Team defenses live only in the rankings export — append them or they vanish
+    dst_rows = _draftsharks_defenses(rk_df)
+    if not dst_rows.empty:
+        result = pd.concat(
+            [result, dst_rows[[c for c in keep if c in dst_rows.columns]]],
+            ignore_index=True,
+        )
+        print(f"  Added {len(dst_rows)} team defenses from the rankings export")
+    else:
+        print("  Warning: no team defenses found in the rankings export")
 
     out = os.path.join(DATA_DIR, "adp.csv")
     result.to_csv(out, index=False)
