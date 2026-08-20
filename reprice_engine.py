@@ -115,6 +115,40 @@ class AuctionState:
         return state
 
 
+def relink_picks(state: AuctionState, projections: pd.DataFrame) -> int:
+    """
+    Re-point recorded picks at the current player_ids after a data refresh.
+
+    Player names are stable across refreshes; ids are not. A player with no stat
+    history gets a name-derived id ("adp_bhayshul_tuten") and switches to their
+    gsis id once history exists, which would orphan any pick already recorded
+    against the old id — the player would quietly reappear as undraftable.
+
+    Returns the number of picks relinked.
+    """
+    if projections is None or projections.empty or not state.results:
+        return 0
+
+    valid   = set(projections["player_id"].astype(str))
+    by_name = dict(zip(
+        projections["player_name"].astype(str).str.lower().str.strip(),
+        projections["player_id"].astype(str),
+    ))
+
+    relinked = 0
+    for pick in state.results:
+        if pick.player_id in valid:
+            continue
+        new_id = by_name.get(pick.player_name.lower().strip())
+        if new_id:
+            pick.player_id = new_id
+            relinked += 1
+
+    if relinked:
+        state._rebuild_state()
+    return relinked
+
+
 # ─── Repricing ────────────────────────────────────────────────────────────────
 
 MIN_PICKS_FOR_ADJUSTMENT = 3   # need at least this many sold at a position before adjusting

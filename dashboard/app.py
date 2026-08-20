@@ -8,6 +8,7 @@ Deploy:       Streamlit Community Cloud (streamlit.io/cloud)
 
 import os
 import sys
+import time
 
 import pandas as pd
 import streamlit as st
@@ -15,11 +16,19 @@ import streamlit.components.v1 as components
 import plotly.express as px
 import plotly.graph_objects as go
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, REPO_ROOT)
+
+# projection_engine and webscraping resolve data/ relative to the working
+# directory, so anchor it here — the app can be launched from anywhere.
+if not os.path.isdir(os.path.join(os.getcwd(), "data")):
+    os.chdir(REPO_ROOT)
 
 import session_store
 from projection_engine import run as run_projections, compute_fantasy_points
-from reprice_engine import AuctionState, DraftResult, reprice, position_market_summary
+from reprice_engine import (
+    AuctionState, DraftResult, reprice, position_market_summary, relink_picks,
+)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -330,6 +339,7 @@ def current_snapshot() -> dict:
         st.session_state.avoid_list,
         st.session_state.player_comments,
         st.session_state.budget_plan,
+        settings={"auto_refresh": st.session_state.get("auto_refresh", True)},
     )
 
 
@@ -341,6 +351,10 @@ def apply_snapshot(snap: dict) -> None:
     st.session_state.player_comments = dict(snap.get("comments", {}))
     if snap.get("budget_plan"):
         st.session_state.budget_plan = {k: list(v) for k, v in snap["budget_plan"].items()}
+    # Sticky preferences — absent from pre-settings snapshots, so keep the default
+    settings = snap.get("settings") or {}
+    if "auto_refresh" in settings:
+        st.session_state.auto_refresh = bool(settings["auto_refresh"])
     # The data_editor caches its own edits under this key and would otherwise
     # re-apply them over the restored plan
     st.session_state.pop("budget_plan_editor", None)
@@ -369,9 +383,12 @@ if "_restore_checked" not in st.session_state:
         _saved = session_store.load_snapshot(DRAFT_STATE_PATH)
         if _saved:
             apply_snapshot(_saved)
-            st.session_state.restore_notice = (
-                f"Restored previous session — {session_store.describe_picks(_saved)}."
-            )
+            # Only announce a restore that actually brought something back —
+            # an empty autosave from a previous idle visit isn't news
+            if session_store.has_content(_saved):
+                st.session_state.restore_notice = (
+                    f"Restored previous session — {session_store.describe_picks(_saved)}."
+                )
             st.session_state._last_saved = session_store.snapshot_to_json(_saved)
     except ValueError as exc:
         # Unreadable save file: warn and stop autosaving so it isn't overwritten
@@ -400,14 +417,84 @@ STATS_PATH       = os.path.join(DATA_DIR, "data", "seasonal_stats.csv")
 SCHEDULE_PATH    = os.path.join(DATA_DIR, "data", "schedule.csv")
 ADP_PATH         = os.path.join(DATA_DIR, "data", "adp.csv")
 
-if st.sidebar.button("🔄 Load / Refresh Projections"):
-    if os.path.exists(PROJECTIONS_PATH):
-        df = load_projections_csv(PROJECTIONS_PATH)
-    else:
-        df = compute_projections(ppr, proj_season)
+# ─── Sidebar: Data Freshness ──────────────────────────────────────────────────
+# Expert values and ADP move daily in draft season, so the app re-fetches them on
+# startup when they're stale. Only session *data* is replaced — every pick, tag,
+# note, and budget edit is left alone (see set_projections).
+
+DATA_MAX_AGE_HOURS = 12
+
+
+def data_age_hours(path: str) -> float | None:
+    """Hours since the file was last written; None if it doesn't exist."""
+    if not os.path.exists(path):
+        return None
+    return (time.time() - os.path.getmtime(path)) / 3600
+
+
+def format_age(hours: float | None) -> str:
+    if hours is None:
+        return "never"
+    if hours < 1:
+        return f"{int(hours * 60)} min ago"
+    if hours < 48:
+        return f"{int(hours)} hr ago"
+    return f"{int(hours / 24)} days ago"
+
+
+def set_projections(df: pd.DataFrame) -> int:
+    """Install a new projections table, keeping the live auction intact.
+
+    Ids can change between refreshes, so already-recorded picks are re-pointed
+    at the new table by name. Tags, notes, and the budget plan are keyed by
+    player name and need no migration.
+    """
     st.session_state.projections = df
-    st.session_state.auction_state = AuctionState(teams=num_teams, budget=float(budget))
-    st.sidebar.success(f"Loaded {len(df):,} players.")
+    return relink_picks(st.session_state.auction_state, df)
+
+
+def refresh_expert_data(ppr_val: float, season: int) -> tuple[bool, str]:
+    """Re-fetch DraftSharks values, then rebuild projections from them.
+
+    Historical stats aren't re-fetched: past seasons are final, and the
+    play-by-play rebuild is minutes of work for data that hasn't changed.
+    Any failure leaves the committed CSVs in place — the board still loads.
+    """
+    try:
+        import webscraping   # local import: keeps nfl_data_py off the startup path
+        webscraping.fetch_draftsharks_data()
+    except Exception as exc:
+        return False, f"Couldn't reach DraftSharks ({exc}). Using the values already on disk."
+
+    try:
+        df = run_projections(ppr=ppr_val, projection_season=season)
+    except Exception as exc:
+        return False, f"Got new values but the projection engine failed: {exc}"
+
+    load_projections_csv.clear()      # the CSV on disk just changed
+    compute_projections.clear()
+    relinked = set_projections(df)
+    note = f" ({relinked} picks relinked)" if relinked else ""
+    return True, f"Updated {len(df):,} players from DraftSharks{note}."
+
+
+st.sidebar.divider()
+st.sidebar.subheader("📈 Data")
+st.sidebar.caption(f"Values updated **{format_age(data_age_hours(ADP_PATH))}**")
+
+auto_refresh = st.sidebar.checkbox(
+    "Auto-refresh on startup",
+    value=st.session_state.get("auto_refresh", True),
+    help=f"Re-fetch DraftSharks values when the app starts and they're more than "
+         f"{DATA_MAX_AGE_HOURS} hours old. Turn this off during the auction if you "
+         f"don't want prices moving mid-draft.",
+)
+st.session_state.auto_refresh = auto_refresh
+
+if st.sidebar.button("🔄 Refresh values now", use_container_width=True):
+    with st.spinner("Fetching the latest DraftSharks values..."):
+        ok, msg = refresh_expert_data(ppr, proj_season)
+    (st.sidebar.success if ok else st.sidebar.warning)(msg)
 
 st.sidebar.divider()
 if st.sidebar.button("🗑️ Reset Auction"):
@@ -463,10 +550,30 @@ if _upload is not None:
             st.session_state._restored_upload_id = _uid
             st.sidebar.error(f"Couldn't restore: {exc}")
 
-# ─── Auto-load projections on first visit ─────────────────────────────────────
+# ─── Startup: load, then refresh if stale ─────────────────────────────────────
 
-if st.session_state.projections is None and os.path.exists(PROJECTIONS_PATH):
-    st.session_state.projections = load_projections_csv(PROJECTIONS_PATH)
+if st.session_state.projections is None:
+    try:
+        if os.path.exists(PROJECTIONS_PATH):
+            set_projections(load_projections_csv(PROJECTIONS_PATH))
+        else:
+            set_projections(compute_projections(ppr, proj_season))
+    except FileNotFoundError as exc:
+        # No projections and no stats to build them from — say so instead of
+        # dumping a traceback over the whole page
+        st.error(f"{exc}")
+        st.stop()
+
+# Once per browser session: pull fresh expert values if the ones on disk are old.
+# Runs after the load above so a failed fetch still leaves a usable board.
+if "_auto_refresh_done" not in st.session_state:
+    st.session_state._auto_refresh_done = True
+    _age = data_age_hours(ADP_PATH)
+    if auto_refresh and (_age is None or _age > DATA_MAX_AGE_HOURS):
+        with st.spinner(f"Values are {format_age(_age)} — checking DraftSharks for updates..."):
+            _ok, _msg = refresh_expert_data(ppr, proj_season)
+        # info, not error, on failure: stale values still beat no board
+        (st.sidebar.success if _ok else st.sidebar.info)(_msg)
 
 projections = st.session_state.projections
 state       = st.session_state.auction_state

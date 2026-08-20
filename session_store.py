@@ -32,8 +32,13 @@ def build_snapshot(
     avoid: set | list | None = None,
     comments: dict | None = None,
     budget_plan: dict | None = None,
+    settings: dict | None = None,
 ) -> dict:
-    """Capture everything the user would hate to re-enter."""
+    """Capture everything the user would hate to re-enter.
+
+    'settings' holds sticky preferences (e.g. auto-refresh) so a mid-draft choice
+    survives a reload. It's optional on read, so older snapshots still load.
+    """
     return {
         "version":     SNAPSHOT_VERSION,
         "auction":     state.to_dict(),
@@ -41,6 +46,7 @@ def build_snapshot(
         "avoid":       sorted(avoid or []),
         "comments":    {k: v for k, v in (comments or {}).items() if v},
         "budget_plan": {k: list(v) for k, v in (budget_plan or {}).items()},
+        "settings":    dict(settings or {}),
     }
 
 
@@ -111,6 +117,17 @@ def backup_existing(path: str) -> str | None:
         return backup
     except OSError:
         return None
+
+
+def has_content(snapshot: dict) -> bool:
+    """True if the snapshot holds anything the user actually entered. An autosave
+    written during an idle visit is structurally valid but empty."""
+    return bool(
+        snapshot.get("auction", {}).get("results")
+        or snapshot.get("targets")
+        or snapshot.get("avoid")
+        or snapshot.get("comments")
+    )
 
 
 def describe_picks(snapshot: dict) -> str:

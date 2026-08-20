@@ -217,8 +217,11 @@ DRAFT_SHARKS_PASSWORD=yourpassword
 ```
 
 `.env` is gitignored. Without it the scraper prints a warning and falls back to free FantasyPros
-ADP. **The dashboard itself needs no credentials** — the CSVs in `data/` are committed, so a
-cloned or deployed copy runs immediately.
+ADP. **The dashboard itself needs no credentials to run** — the CSVs in `data/` are committed, so a
+cloned or deployed copy works immediately; it just can't refresh values on startup.
+
+For a Streamlit Cloud deploy, put the same two keys in the app's **Secrets** (Streamlit exposes
+secrets as environment variables, which is where `_ds_login()` looks) to enable refresh there too.
 
 ### Refresh Data
 ```bash
@@ -250,9 +253,23 @@ Opens at `http://localhost:8501`.
 ## Using the Dashboard
 
 **Sidebar** — PPR format, number of teams, budget per team, projection season.
-**Load / Refresh Projections** reads `data/projections.csv` if present, otherwise runs the engine
-live. **Reset Auction** clears all recorded picks (after copying the current save to
+**Reset Auction** clears all recorded picks (after copying the current save to
 `draft_state.backup.json`).
+
+### 📈 Data freshness — updates on startup
+Expert values and ADP move daily in draft season, so when the app starts and `data/adp.csv` is
+more than **12 hours** old it re-fetches DraftSharks and rebuilds projections before rendering.
+The sidebar shows how old the values are, and **🔄 Refresh values now** forces it any time.
+
+- **Your work is never touched by a refresh.** Picks, tags, notes, and the budget plan all survive
+  it. Picks are re-pointed at the new data by player name, so a pick still counts even if that
+  player's internal id changed between refreshes.
+- **Historical stats are not re-fetched** — past seasons are final, and rebuilding them from
+  play-by-play takes minutes. Refresh means expert values, ADP, and projections.
+- **Failure is harmless.** No network, no credentials, or a read-only filesystem just leaves the
+  committed CSVs in place and shows a note. The board always loads.
+- **Uncheck "Auto-refresh on startup" during the auction** if you don't want prices moving
+  mid-draft. The choice is saved with your draft state, so a reload respects it.
 
 ### 💾 Draft State — your work survives a refresh
 Picks, tags, notes, and budget edits are saved automatically to `data/draft_state.json` after every

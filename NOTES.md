@@ -4,6 +4,43 @@ Context-recovery notes for Claude Code. Newest session at the top.
 
 ---
 
+## 2026-08-20 — Startup data refresh (values update, tags survive)
+
+Expert values move daily in draft season, so the app now re-fetches DraftSharks on startup when
+`data/adp.csv` is older than `DATA_MAX_AGE_HOURS` (12), rebuilds projections, and renders. Manual
+**🔄 Refresh values now** button forces it.
+
+**The bug this exposed:** the old "Load / Refresh Projections" button did
+`st.session_state.auction_state = AuctionState(...)` — refreshing projections *wiped the entire
+auction*. Clicking it mid-draft would have destroyed every pick. Gone; refresh now only replaces
+the projections table.
+
+Only expert data is re-fetched — not historical stats. Past seasons are final and the PBP rebuild
+is minutes of work for identical data.
+
+**`relink_picks()` (reprice_engine)** — player ids aren't stable across refreshes. A player with no
+stat history gets a name-derived id (`adp_bhayshul_tuten`) and switches to their gsis id once
+history exists. A pick recorded against the old id would silently orphan: `drafted_ids()` wouldn't
+match, and the player would reappear as available mid-auction. Picks are now re-pointed by name
+(names are stable) after every refresh. Tags/notes are keyed by name already, so they need nothing.
+
+Gating and failure behavior:
+- Once per browser session, and only when the data is actually stale — a mid-draft page reload
+  won't re-fetch, because the last fetch was minutes ago.
+- "Auto-refresh on startup" checkbox, persisted in the snapshot under a new optional `settings`
+  key (no version bump — older snapshots still load). Uncheck it during the auction to freeze
+  prices; the choice survives a reload.
+- Any failure (no network, bad creds, read-only fs) leaves the committed CSVs in place and shows
+  an info line. Verified by monkeypatching `fetch_draftsharks_data` to raise: board still rendered
+  1,001 players, picks intact, adp.csv untouched.
+- `os.chdir(REPO_ROOT)` guard at import — projection_engine and webscraping resolve `data/`
+  relative to cwd, so launching from anywhere but the repo root wrote to the wrong place.
+
+Also: an empty autosave from an idle visit no longer announces "Restored previous session — 0
+picks" on reload (`session_store.has_content`).
+
+---
+
 ## 2026-08-20 — Fixed: missing DST, no persistence
 
 ### DST — root cause was a silent merge drop, not a missing source
