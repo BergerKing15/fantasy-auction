@@ -1,96 +1,129 @@
 # Session Notes
 
-## 2026-05-17 — Session 1 & 2 (Build + Bugfix)
-
-### Task Status (from CLAUDE.md)
-1. [x] Gather Context
-2. [x] Ask Questions / Recommendations
-3. [x] Write initial README
-4. [x] Webscrape
-5. [x] Build projection engine
-6. [x] Backtest
-7. [x] Build reprice engine
-8. [x] Build dashboard
-9. [ ] Deploy — PARTIALLY DONE (git initialized, needs GitHub remote + Streamlit Cloud)
+Context-recovery notes for Claude Code. Newest session at the top.
 
 ---
 
+## 2026-08-20 — Doc Sync (read-through, no code changes)
+
+Read the full codebase and brought README.md / NOTES.md back in line with what the code
+actually does. No behavior changed. What the docs had been wrong about:
+
+| Doc claim (old) | Reality |
+|---|---|
+| ADP from FantasyPros | DraftSharks primary (auth'd CSV export), FantasyPros is the fallback |
+| Shrinkage `K = 16` | `SHRINKAGE_K = 8.0` |
+| Simple 3-season average | Recency-weighted (1.0 / 0.7 / 0.4) + age decay past 30 |
+| No ADP blend documented | `ADP_BLEND = 0.85` toward expert value, PAR-history players only |
+| Replacement = QB12/RB30/WR30/TE13 | QB18 / RB89 / WR114 / TE31 (via `BENCH_DEPTH`) |
+| Hittable budget $2,292 (108 slots) | $2,208 (192 slots = 12 × (9 starters + 6 bench + 1 IR)) |
+| Dashboard = "run streamlit" | 5 tabs, tags, notes, pick management, editable budget plan |
+| No `.env` setup documented | DraftSharks credentials required to re-fetch data |
+| Backtest table from the K=16 era | Re-run 2026-08-20, numbers below |
+
+Also fixed: the in-app "How are values calculated?" expander quoted the old replacement counts.
+
+**Backtest re-run 2026-08-20** (PPR=1.0, seasons 2017–2025, ≥6 games):
+
+| Position | n | MAE | RMSE |
+|---|---|---|---|
+| QB | 332 | 97.0 | 121.4 |
+| RB | 714 | 61.9 | 74.4 |
+| WR | 1,147 | 55.3 | 67.1 |
+| TE | 632 | 42.3 | 51.4 |
+| Overall | 2,825 | 59.0 | 74.5 |
+
+Per-season MAE 56.2–64.5 — stable, no season dominating. Essentially unchanged from the K=16
+numbers overall, but with the tuned model 2025 is now included in the eval set.
+
+**Current data snapshot:** 6,681 stat rows (2014–2025) · 8,725 players · 524 DraftSharks rows ·
+998 projections (WR 374, RB 243, TE 195, QB 120, K 66 — **no DST**) · 488 of them carry a DS value.
+
+---
+
+## 2026-05-18 → 05-24 — Sessions 3–5 (DraftSharks, Player Profiles, TODO cleanup)
+
+Reconstructed from git history (`d84405a` → `fc92917`).
+
+### DraftSharks integration (`d84405a`, `3fdda1c`, `f545a24`)
+- Replaced FantasyPros as the primary value source. `_ds_login()` posts to `/login` with the
+  `_frontendCSRF` token scraped from the login form; creds come from `.env`.
+- Two CSV exports pulled: `/auction-values/export` and `/rankings/export`, merged on Player+Team.
+- **Critical parameter:** the export endpoint needs `?pprSuperflexSlug=ppr`. Without it the
+  endpoint silently returns standard (non-PPR) values — this looked correct but wasn't.
+  `scoring=ppr` does *not* work.
+- Two dollar columns kept deliberately: `ds_auction_value` (DS model) and
+  `market_auction_value` (crowd consensus). The dashboard shows both.
+- adp.csv schema changed completely — it is now DraftSharks-shaped, not FantasyPros-shaped.
+  `blend_adp()` branches on the presence of `ds_auction_value` to stay backward compatible.
+
+### Calibration (`99394f0`, `63ab318`, `3bef2a0`)
+- `SHRINKAGE_K` 16 → 8 (trust recent stats more).
+- `BENCH_DEPTH` tuned to RB 3.5 / WR 4.5 / QB 1.5 / TE 2.5.
+- `ADP_BLEND` 0.5 → 0.85. The stat model can't see team context, target share, or camp news;
+  the expert value can.
+- Rookie injection: DS players with no stat history get their DS value + a rookie-prior fpts.
+
+### Player profiles (`155a72f`, `694d672`, `630e4c5`)
+- Headshots via `<img>` HTML (Streamlit can't fetch the NFL CDN server-side).
+- Row-click on the Player Board sets `nav_to_profile`, then a JS snippet clicks tab index 4.
+  Fragile if tab order changes — the index is hardcoded.
+- `Styler.applymap` → `Styler.map` for pandas 2.1+.
+
+### TODO.txt items 1–12 (`fddf0be`, `c3aa82c`, `fc92917`)
+All 12 user-reported items resolved — see TODO.txt for the item-by-item record. Highlights:
+pick delete/price-correct, owner dropdown, target/avoid tags, player notes, rank column,
+DS-only filter for skill positions (drops retirees like Flacco/Carr from the board),
+editable MIN/MAX budget plan on the Teams tab.
+
+### Deploy status
+- GitHub remote is live: `https://github.com/BergerKing15/fantasy-auction.git`, master pushed.
+- Streamlit Community Cloud: **not yet set up** — repo → streamlit.io/cloud → main file
+  `dashboard/app.py` → Deploy.
+
+---
+
+## 2026-05-17 — Sessions 1 & 2 (Build + Bugfix)
+
 ### Decisions Made
 - **Dashboard**: Streamlit (not React/Vercel). Deploy free on Streamlit Community Cloud.
-- **Data**: nfl_data_py (stats) + FantasyPros scraping (ADP). Dropped FantasyData — paywall.
+- **Data**: nfl_data_py for stats. FantasyData dropped — paywall. (ADP later moved to DraftSharks.)
 - **ML**: Bayesian shrinkage toward position/age-group priors. Simple, interpretable.
 
 ### League Settings
 - 12 teams, $200 budget
-- Roster: QB, RB, RB, WR, WR, TE, FLEX (RB/WR/TE), K, DST + 5-8 bench + 1 IR
-- Scoring: 6 pts/TD ALL types (including passing — non-standard), 0.05/pass yd, 0.1/rush+rec yd, PPR configurable
-- Weeks 1-14 regular season, 15-17 playoffs, top 6 qualify
-- INT penalty and fumble lost: assumed -2 each (not confirmed by user — ask if wrong)
-
----
+- Roster: QB, RB, RB, WR, WR, TE, FLEX (RB/WR/TE), K, DST + 5–8 bench + 1 IR
+- Scoring: 6 pts/TD ALL types (including passing — non-standard), 0.05/pass yd, 0.1/rush+rec yd
+- Weeks 1–14 regular season, 15–17 playoffs, top 6 qualify
+- INT penalty and fumble lost: assumed −2 each (still not confirmed by user)
 
 ### Data Notes
-- nfl_data_py seasonal data has no position column — merged from players.csv via player_id -> gsis_id
-- nflverse pre-aggregated player_stats file is not yet published for 2025 — webscraping.py uses play-by-play fallback (_seasonal_from_pbp)
-- STAT_YEARS: 2014-2025
-- Data downloaded: 6,681 player-season rows, 8,342 players, 1,189 ADP rows
+- nfl_data_py seasonal data has no position column — merged from players.csv via
+  `player_id` → `gsis_id`.
+- nflverse's pre-aggregated player_stats file lags for the most recent season;
+  `_seasonal_from_pbp()` rebuilds it from play-by-play.
 
-### Key Files
-- data/seasonal_stats.csv — historical player stats 2014-2025
-- data/players.csv — player metadata (name, position, birth_date, gsis_id)
-- data/adp.csv — FantasyPros ADP (std/half/ppr)
-- data/projections.csv — 818 players with projected fpts and auction values
-
----
-
-### Backtest Results (PPR=1.0, seasons 2017-2024)
-| Position | n    | MAE  | RMSE  |
-|----------|------|------|-------|
-| QB       | 295  | 95.5 | 118.4 |
-| RB       | 645  | 61.9 | 73.9  |
-| WR       | 1023 | 55.5 | 66.5  |
-| TE       | 557  | 42.7 | 51.4  |
-| Overall  | 2520 | 59.0 | 73.6  |
-
-### Auction Value Calibration
-- Budget check: top-192 players sum to exactly $2,400 (12 x $200) ✓
-- 162 players priced above $1
-- Top values: CMC $51.7, Jahmyr Gibbs $44.1, Ja'Marr Chase $41.8, Josh Allen (QB) $28.0, Trey McBride (TE) $21.1
-- Calibrated against RotoWire 12-team values — comparable to their $44 top player range
-- Key config: BENCH_DEPTH = {QB:1.5, RB:2.5, WR:2.5, TE:1.5} — using starter-only counts produced only 80 players with PAR and inflated top values to $78+
+### Bugs Fixed
+- `groupby().apply()` O(n) Python loops → vectorized `.agg()`; projection time minutes → 0.15s
+- `data/` was gitignored — the deployed app needs the CSVs, so it's tracked now
+- `sys.exit()` crashes Streamlit → `raise FileNotFoundError`
+- `to_csv()` fails on Streamlit Cloud's read-only fs → wrapped in `try/except OSError`
+- Age stratification broken (seasonal_stats had no age column → every prior keyed "unknown")
+  → age merged in before computing priors
+- `pd.concat([])` crash when all backtest seasons skipped → guarded
+- Auction values inflated ($78 top player) → `BENCH_DEPTH` multipliers added
 
 ---
 
-### Bugs Fixed (Session 2)
-- groupby().apply() was O(n) Python loops → replaced with vectorized .agg() — projection time: minutes -> 0.15s
-- data/ directory was gitignored — removed
-- sys.exit() crashes Streamlit — replaced with raise FileNotFoundError
-- result.to_csv() fails on Streamlit Cloud read-only fs — wrapped in try/except OSError
-- Age stratification was broken — seasonal_stats had no age column, all priors keyed to "unknown" — fixed by merging age into stats before computing priors
-- Duplicate birth_date → age computation — deduplicated into single age_lookup
-- Dead lookup_prior() function after vectorization — removed
-- Unused imports (LEAGUE, np, scipy, Literal, sys) — removed
-- pd.concat([]) crash when all backtest seasons skipped — guarded with if rows else pd.DataFrame()
-- display_name fetched in merge then discarded — removed from merge
-- 2025 nflverse pre-aggregated file unavailable (HTTP 404) — PBP aggregation fallback added
-- Auction values inflated ($78+ top player) — added BENCH_DEPTH multipliers to replacement levels
+## Open Items
 
----
-
-### Deploy Status (Task 9)
-- [x] Git repo initialized (master branch, 2 commits)
-- [ ] GitHub remote not yet pushed — user needs to:
-  1. Create repo at github.com (name: fantasy-auction, public, no README)
-  2. Run: git remote add origin https://github.com/BergerKing15/fantasy-auction.git
-  3. Run: git push -u origin master
-- [ ] Streamlit Cloud not yet set up — after push:
-  1. Go to streamlit.io/cloud, sign in with GitHub
-  2. New app -> select repo -> main file: dashboard/app.py -> Deploy
-
----
-
-### Known Limitations / TODO
-- Kicker (K) and DST projections not implemented — values are implicitly $1 (minimum)
-- max_available = 2025 in projection_engine.py — update if nflverse publishes 2025 pre-aggregated stats (would speed up webscraping.py)
-- dashboard/frontend.tsx is an empty leftover file — safe to delete
-- BENCH_DEPTH factors are tuned against RotoWire but not exhaustively validated
+- [ ] Deploy to Streamlit Community Cloud (last step of CLAUDE.md task 9)
+- [ ] **DST missing entirely** — DraftSharks export has no team-defense rows, and the
+      `adp[POS startswith "D"]` fallback in `projection_engine.run()` finds nothing.
+      Needs a separate DST source or manual entry.
+- [ ] No persistence — a browser refresh mid-auction wipes picks/tags/notes. A JSON
+      save/load button on the Live Draft tab would be cheap insurance before draft day.
+- [ ] `max_available = 2025` hardcoded in `project_players()` — bump when 2026 stats exist
+- [ ] Kickers have DS values but no projected points
+- [ ] Confirm INT / fumble scoring against actual league rules
+- [ ] Profile-tab navigation depends on the hardcoded tab index 4 in the JS click handler

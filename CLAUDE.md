@@ -30,11 +30,17 @@ Tools:
         I have not created a repository yet. LMK if you need my password
 
 Data:
+    SUPERSEDED — FantasyData is paywalled. Live sources are now nfl_data_py (stats, players,
+    schedules) and DraftSharks (auction values + ADP). See README.md "Data Sources".
+    Original plan below, kept for reference:
+
     ADP data from https://fantasydata.com/nfl/adp?season=2025&team= (or https://fantasydata.com/nfl/ppr-adp?season=2025&team= for ppr). Ranges from 2014 to 2026
 
     Performance stats from https://fantasydata.com/nfl/fantasy-football-leaders?scope=season&sp=2025_REG&scoring=fpts_ppr&order_by=fpts_ppr&sort_dir=desc
 
     NFL Schedules from https://fantasydata.com/nfl/schedule?season=2026
+
+    use draftsharks.com for better data. login is in .env as DRAFT_SHARKS_USER and DRAFT_SHARKS_PASSWORD . https://www.draftsharks.com/auction-values has their auction values to use as a reference. Obviously shouldn't be exactly the same as theirs but good sanity check. make sure to use it. Use https://www.draftsharks.com/rankings/ppr for ADP. Can also look at https://www.draftsharks.com/kb/best-auction-draft-strategy-salary-cap for strategy help if you want. 
 
 File Tree:
     CLAUDE.md
@@ -43,6 +49,10 @@ File Tree:
         Your place to take notes to recover context between sessions
     README.md
         Typical README including overview, methods, files, user guide, etc
+    TODO.txt
+        My reported issues / feature requests, with your resolution noted per item
+    .env
+        DraftSharks login (gitignored) — needed only to re-fetch data
     projection_engine.py
     backtest.py
         backtest the projection engine
@@ -50,6 +60,7 @@ File Tree:
     webscraping.py
     data
         whatever data from webscraping and outputted from the engines
+        (tracked in git so the deployed dashboard has data)
     dashboard
         whatever for the frontend
 

@@ -1,6 +1,8 @@
 # Fantasy Football Auction Dashboard — 2026–27 Season
 
-A Python tool that scrapes historical NFL stats, builds Bayesian player projections, converts those projections to auction dollar values, and dynamically reprices players during a live draft.
+A Python tool that pulls historical NFL stats and expert auction data, builds Bayesian player
+projections, converts them to auction dollar values, and dynamically reprices players during a
+live draft. The frontend is a Streamlit dashboard you can run locally or share as a URL.
 
 ---
 
@@ -10,7 +12,19 @@ Auction fantasy football requires answering two questions:
 1. **What is each player worth?** (projection engine)
 2. **What is each player worth *right now*, given what's already been spent?** (reprice engine)
 
-This tool answers both. Projections use Bayesian shrinkage — every player's forecast regresses toward the historical base rate for their position/age group, preventing outliers and giving reasonable estimates for rookies and injury returnees. Auction values are derived from Points Above Replacement (PAR), so dollar totals always sum to the total league budget.
+This tool answers both.
+
+Values come from two sources that are deliberately kept separate on the board:
+
+| Column | Source |
+|---|---|
+| **DS Value $** | DraftSharks' own PPR auction model (their number, used as-is when available) |
+| **Market $** | DraftSharks' crowd-sourced auction market consensus — what owners actually pay |
+| **Current $** | DS Value adjusted live by the reprice engine as picks come in |
+| **Proj Pts** | This repo's Bayesian projection (recency-weighted, shrunk toward position priors) |
+
+For any skill player DraftSharks *doesn't* cover, the value falls back to this repo's own
+Points-Above-Replacement model. See [Methods](#methods).
 
 ---
 
@@ -21,53 +35,117 @@ This tool answers both. Projections use Bayesian shrinkage — every player's fo
 | Teams | 12 |
 | Budget per team | $200 |
 | Starters | QB, RB, RB, WR, WR, TE, FLEX (RB/WR/TE), K, DST |
-| Bench spots | 5–8 |
+| Bench spots | 5–8 (engine assumes 6) |
 | IR slots | 1 |
-| Scoring | 6 pts/TD (all types), 0.05 pts/pass yd, 0.1 pts/rush+rec yd |
-| PPR | Configurable (0, 0.5, or 1.0) |
+| Scoring | 6 pts/TD (all types, including passing), 0.05 pts/pass yd, 0.1 pts/rush+rec yd |
+| Turnovers | −2 per INT, −2 per fumble lost (assumed — not confirmed by league rules) |
+| PPR | Configurable (0, 0.5, or 1.0); all shipped data is built at full PPR |
 | Regular season | Weeks 1–14 |
 | Playoffs | Weeks 15–17 (top 6 teams) |
+
+Teams and budget are adjustable in the dashboard sidebar. Roster composition is currently fixed in
+`LEAGUE` inside [projection_engine.py](projection_engine.py#L31).
 
 ---
 
 ## Methods
 
-### 1. Data Collection
-- **Player stats (2014–2025):** `nfl_data_py` — pulls from nflverse's free, curated dataset.
-- **ADP (current season):** Scraped from FantasyPros, which aggregates across ESPN, Yahoo, Sleeper, and NFL.
+### 1. Data Collection ([webscraping.py](webscraping.py))
+- **Player stats (2014–2025):** `nfl_data_py` (nflverse). The most recent season is usually not
+  published as a pre-aggregated file yet, so `_seasonal_from_pbp()` rebuilds it from play-by-play.
+- **Player metadata:** `nfl_data_py.import_players()` — name, position, birth date, headshot, team.
+- **Schedule (2026):** `nfl_data_py.import_schedules()` → `data/schedule.csv`.
+- **Auction values + ADP:** **DraftSharks** CSV exports (requires a paid account — see
+  [Setup](#setup)). Pulls DS auction value, market auction value, ADP, DS/consensus projections,
+  floor/ceiling, injury risk, and strength of schedule.
+- **Fallback:** if the DraftSharks login or export fails, `fetch_all_adp()` scrapes free
+  FantasyPros ADP instead, and the engine derives values from a position-rank log curve.
 
 ### 2. Fantasy Points
-Each player-season is scored under the league's custom settings. PPR multiplier (0, 0.5, or 1.0) is configurable at runtime.
+Each player-season is scored under the league's custom settings. The PPR multiplier (0, 0.5, 1.0)
+is a runtime argument, so the whole pipeline can be rerun for any format.
 
-### 3. Bayesian Projections
-For each player, projected points-per-game is:
+### 3. Bayesian Projections ([projection_engine.py](projection_engine.py))
+
+**Recency-weighted empirical rate.** The 3 most recent seasons are pooled, with older seasons
+discounted so a stale year can't outvote a current one:
+
+| Seasons back | Weight |
+|---|---|
+| 0 (most recent) | 1.0 |
+| 1 | 0.7 |
+| 2 | 0.4 |
+
+`ppg = Σ(fpts × weight) / Σ(games × weight)`. A 4-game injury season two years back contributes
+~1.6 effective games; a healthy 17-game season last year contributes 17.
+
+**Shrinkage toward a prior.** Projected per-game points is
 
 ```
-projection = w × empirical_ppg + (1 - w) × position_prior
+projection_ppg = w × empirical_ppg + (1 − w) × prior_ppg
+w = total_games / (total_games + 8)
 ```
 
-Where `w = games_played / (games_played + K)` and `K = 16`. This means:
-- Players with a full season of data are weighted ~50% vs. their position prior.
-- Rookies (0 games) receive 100% position prior — projected like an average rookie at their position.
-- Veterans with multiple seasons accumulate more empirical weight each year.
+Priors are the mean PPG for that **position × age bracket** (rookie ≤23, young ≤27, prime ≤30,
+veteran 31+), computed from the prior 8 seasons. With `K = 8`, a player with three full seasons
+(~51 games) gets ~86% empirical weight; a rookie with no games gets 100% prior — i.e. projected
+like an average rookie at their position.
 
-Priors are computed from historical data, stratified by position and age bracket.
+**Age decay.** Players over 30 lose 3% per year past 30, floored at −30%.
 
-### 4. Auction Values (PAR Method)
-1. Compute replacement level = projected points of the last expected starter at each position (QB12, RB30, WR30, TE13).
-2. For each player: `PAR = max(0, projected_pts - replacement_level)`
-3. Total hittable budget = `12 × $200 − 108 × $1 = $2,292` (one $1 minimum per starter slot)
-4. Auction value = `$1 + (PAR / total_PAR) × $2,292`
+**Season total** = `projection_ppg × age_adjustment × 17`.
 
-### 5. Repricing (Live Draft)
-As players are bought during the auction:
-- Track actual price vs. projected price for each player sold.
-- Compute per-position discount/premium factor: `mean(actual / projected)` for that position.
-- Apply this factor to all remaining unsold players at that position.
-- Account for remaining roster needs and remaining budgets across teams.
+### 4. Auction Values — PAR Method
+1. **Replacement level** = the projected points of the last player expected to be rostered at that
+   position, including bench depth. Starter counts alone leave only ~80 players above replacement,
+   which concentrates every dollar at the top. With `BENCH_DEPTH` multipliers the pool is:
 
-### 6. Backtest
-To validate accuracy, projections are generated using only data available through year `Y-1`, then compared against actual `Y` performance. Metrics: RMSE and MAE on projected vs. actual fantasy points.
+   | Position | Players above replacement |
+   |---|---|
+   | QB | 18 |
+   | RB | 89 |
+   | WR | 114 |
+   | TE | 31 |
+
+2. **PAR** = `max(0, projected_fpts − replacement_pts)`.
+3. **Hittable budget** = `12 × $200 − 192 roster slots × $1 = $2,208`
+   (192 = 12 teams × (9 starters + 6 bench + 1 IR)).
+4. **Auction value** = `$1 + (PAR / total_PAR) × $2,208`.
+5. **ADP blend** — the PAR value is blended 85/15 toward the expert value
+   (`ADP_BLEND = 0.85`). Only players with real PAR history are blended; blending $1 depth players
+   toward high expert values would bloat the pool and crush everyone else.
+6. **Missing players are injected** — anyone in the DraftSharks export with no stat history
+   (rookies, name mismatches) is added with their expert value and a rookie-prior point estimate.
+
+> **In practice:** the dashboard overwrites `auction_value` with the raw DraftSharks value wherever
+> one exists (~488 of 998 players), so the PAR model mainly drives **Proj Pts**, the reprice
+> baseline, and the values for players DraftSharks doesn't rank.
+
+### 5. Repricing — Live Draft ([reprice_engine.py](reprice_engine.py))
+- Every recorded pick stores actual price vs. the value we had projected.
+- Once **3+** players at a position have sold, that position gets a factor =
+  `median(actual / projected)` — median, not mean, so one panic bid doesn't move the market.
+- A **budget factor** compares dollars still on the table against the value still on the board and
+  scales everything proportionally, clipped to [0.5, 2.0] to cap swings.
+- `Current $ = auction_value × position_factor × budget_factor`, floored at $1.
+
+### 6. Backtest ([backtest.py](backtest.py))
+Projections for season *Y* are built using only data through *Y−1*, then compared against actual
+*Y* results (players with ≥6 games only).
+
+**Current accuracy (2017–2025, full PPR, n = 2,825):**
+
+| Position | n | MAE | RMSE |
+|---|---|---|---|
+| QB | 332 | 97.0 | 121.4 |
+| RB | 714 | 61.9 | 74.4 |
+| WR | 1,147 | 55.3 | 67.1 |
+| TE | 632 | 42.3 | 51.4 |
+| **Overall** | **2,825** | **59.0** | **74.5** |
+
+Per-season MAE is stable at 56–65, i.e. no single season drives the average. QB error is the
+largest in absolute terms simply because QBs score the most points under this league's 6-pt
+passing TD rule.
 
 ---
 
@@ -78,25 +156,30 @@ fantasy_auction/
 ├── CLAUDE.md                # Project instructions for Claude Code
 ├── NOTES.md                 # Session notes for context recovery
 ├── README.md                # This file
+├── TODO.txt                 # User-reported issues / feature requests + resolutions
 ├── requirements.txt         # Python dependencies
-├── webscraping.py           # Fetches stats (nfl_data_py) and ADP (FantasyPros)
-├── projection_engine.py     # Bayesian projections + auction values
-├── backtest.py              # Tests projection accuracy on past seasons
-├── reprice_engine.py        # Live-draft repricing logic
-├── data/                    # Raw and processed CSVs
-│   ├── seasonal_stats.csv   # Historical player stats
-│   ├── players.csv          # Player metadata (age, draft info)
-│   ├── adp.csv              # ADP data (PPR, half, standard)
-│   └── projections.csv      # Output from projection engine
+├── .env                     # DraftSharks credentials (gitignored — see Setup)
+├── pyrightconfig.json       # Pylance/Pyright path resolution for the IDE
+├── webscraping.py           # Stats, players, schedule (nfl_data_py) + DraftSharks/FantasyPros
+├── projection_engine.py     # Bayesian projections + PAR auction values + ADP blend
+├── backtest.py              # Tests projection accuracy on held-out seasons
+├── reprice_engine.py        # Live-draft auction state + repricing logic
+├── data/                    # Raw and processed CSVs (committed so the deployed app has data)
+│   ├── seasonal_stats.csv   # Historical player stats 2014–2025 (6,681 rows)
+│   ├── players.csv          # Player metadata: age, headshot, team (8,725 rows)
+│   ├── adp.csv              # DraftSharks auction values + ADP (524 rows)
+│   ├── schedule.csv         # 2026 regular-season schedule
+│   ├── projections.csv      # Engine output (998 players)
+│   └── backtest_results.csv # Backtest detail (gitignored)
 └── dashboard/
-    └── app.py               # Streamlit frontend
+    └── app.py               # Streamlit frontend (5 tabs)
 ```
 
 ---
 
 ## Setup
 
-**Requirements:** Python 3.9+
+**Requirements:** Python 3.11+
 
 ```bash
 git clone https://github.com/BergerKing15/fantasy-auction.git
@@ -104,11 +187,26 @@ cd fantasy-auction
 pip install -r requirements.txt
 ```
 
-### Fetch Data
+### DraftSharks credentials (only needed to re-fetch data)
+
+`webscraping.py` logs into DraftSharks to download the auction-value and rankings CSV exports.
+Create a `.env` in the repo root:
+
+```
+DRAFT_SHARKS_USER=your@email.com
+DRAFT_SHARKS_PASSWORD=yourpassword
+```
+
+`.env` is gitignored. Without it the scraper prints a warning and falls back to free FantasyPros
+ADP. **The dashboard itself needs no credentials** — the CSVs in `data/` are committed, so a
+cloned or deployed copy runs immediately.
+
+### Refresh Data
 ```bash
 python webscraping.py
 ```
-Downloads stats (2014–2025) and current ADP into `data/`. First run takes ~2–5 minutes.
+Downloads stats, players, schedule, and DraftSharks values into `data/`. First run takes ~2–5
+minutes (play-by-play aggregation for the newest season is the slow part).
 
 ### Run Projections
 ```bash
@@ -120,7 +218,7 @@ Outputs `data/projections.csv`.
 ```bash
 python backtest.py
 ```
-Prints accuracy metrics across held-out seasons.
+Prints per-season and per-position MAE/RMSE.
 
 ### Launch Dashboard
 ```bash
@@ -130,13 +228,72 @@ Opens at `http://localhost:8501`.
 
 ---
 
+## Using the Dashboard
+
+**Sidebar** — PPR format, number of teams, budget per team, projection season.
+**Load / Refresh Projections** reads `data/projections.csv` if present, otherwise runs the engine
+live. **Reset Auction** clears all recorded picks.
+
+### 📋 Player Board
+Every rostered-caliber player, ranked by current value. Filter by position, max price, drafted
+status, or tag (⭐ target / ❌ avoid). The **Rank** column is the board's own ordering; **ADP** is
+the DraftSharks rank, so the two can be compared side by side. **Click any row to jump to that
+player's profile.** The caption shows total board value vs. total league budget as a sanity check.
+
+### 🔴 Live Draft
+Record each pick: player, winning owner (dropdown of the 12 league owners), price paid. Recorded
+picks appear in **Manage Picks**, where you can delete a pick or correct a mistyped price. The
+**Position Market Trends** chart shows which positions are going over or under projection — the
+same factors the reprice engine is applying.
+
+### 👥 Teams
+Spent/remaining budget and roster for every owner, plus **My Budget Plan** — an editable MIN/MAX
+target per roster slot that auto-fills ACTUAL from picks recorded under owner "Me" and flags each
+slot ✅ / ⚠️ over / ⚠️ under.
+
+### 📊 Results
+All picks with actual-vs-projected price and a value ratio, plus a scatter plot against the
+break-even line.
+
+### 🏈 Player Profile
+Headshot, ADP, DS value, market value, projected points, injury risk, bye week; target/avoid
+buttons; a free-text notes field; the player's 2026 schedule with bye highlighted; and a
+season-by-season stat table and fpts/PPG chart.
+
+> ⚠️ **Draft state lives in the browser session.** Picks, tags, notes, and budget edits are held in
+> Streamlit session state — refreshing the page or losing the connection clears them. Keep the tab
+> open for the whole auction, and keep a paper backup of picks.
+
+---
+
 ## Deployment
 
-Deploy to [Streamlit Community Cloud](https://streamlit.io/cloud) for free — non-technical users get a shareable URL with no installs required:
-1. Push this repo to GitHub (public or private).
-2. Log in at streamlit.io/cloud with your GitHub account.
-3. Select the repo, set `dashboard/app.py` as the entry point.
-4. Share the generated URL.
+The repo is on GitHub at [BergerKing15/fantasy-auction](https://github.com/BergerKing15/fantasy-auction).
+To put it in front of non-technical users:
+
+1. Log in at [streamlit.io/cloud](https://streamlit.io/cloud) with the GitHub account.
+2. New app → select the repo → main file path `dashboard/app.py` → Deploy.
+3. Share the generated URL. No installs, no credentials — the committed CSVs are all it needs.
+
+Because `data/` is committed, refreshing data for the deployed app means re-running
+`webscraping.py` + `projection_engine.py` locally and pushing the updated CSVs.
+
+---
+
+## Known Limitations
+
+- **DST is not in the pipeline.** DraftSharks' export contains no team-defense rows, so no DST
+  players reach `projections.csv`. Draft them off your own board.
+- **Kickers are expert-value only.** K rows carry a DraftSharks value but no projected points; the
+  stat model doesn't score kicking.
+- **No persistence.** See the session-state warning above.
+- **Turnover scoring assumed.** INT and fumble-lost are −2 each; confirm against league rules.
+- **Two-source values.** Where DraftSharks covers a player their number wins outright, so board
+  values are only as good as DraftSharks' model. This repo's PAR model is the check on it — a big
+  gap between **Proj Pts** rank and **DS Value $** rank is a signal worth investigating.
+- **`max_available = 2025`** is hardcoded in `project_players()`. Bump it when 2026 stats exist.
+- **`BENCH_DEPTH` is calibrated, not validated.** The multipliers were tuned so top-player values
+  land in the same range as published expert values, not fit to historical auction results.
 
 ---
 
@@ -144,5 +301,9 @@ Deploy to [Streamlit Community Cloud](https://streamlit.io/cloud) for free — n
 
 | Source | Data | Cost |
 |---|---|---|
-| [nfl_data_py / nflverse](https://github.com/nflverse/nfl_data_py) | Player stats 2014–2025 | Free |
-| [FantasyPros](https://www.fantasypros.com/nfl/adp/ppr-overall.php) | ADP (aggregated) | Free |
+| [nfl_data_py / nflverse](https://github.com/nflverse/nfl_data_py) | Player stats 2014–2025, metadata, schedules | Free |
+| [DraftSharks](https://www.draftsharks.com/auction-values/ppr) | Auction values, market values, ADP, projections, injury risk | Paid account |
+| [FantasyPros](https://www.fantasypros.com/nfl/adp/ppr-overall.php) | ADP (fallback only) | Free |
+
+FantasyData (the source originally listed in CLAUDE.md) was dropped — its stat and ADP pages are
+paywalled.

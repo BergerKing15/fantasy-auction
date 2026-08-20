@@ -541,12 +541,19 @@ with tab_board:
 **DS Value $** is DraftSharks' own PPR model value (12-team, $200 budget). **Market $** is the crowd-sourced auction market consensus from DraftSharks (reflects what owners typically pay).
 For players not in DraftSharks the value uses a Points-Above-Replacement (PAR) model:
 
-1. **Bayesian projection** — past PPG is shrunk toward a position average using `w = games / (games + 8)`.
-   Rookies use the positional average as a prior.
-2. **PAR** — subtract replacement-level production (top 36 QB, 60 RB, 60 WR, 24 TE available) to get surplus value.
-3. **Auction conversion** — PAR surplus is scaled so the total budget pool (budget × teams) is fully allocated.
-4. **Live repricing** — once picks are recorded, each position's factor (actual ÷ projected median) adjusts
-   remaining values; a global budget factor shrinks/inflates all values proportionally.
+1. **Bayesian projection** — the last 3 seasons of PPG are recency-weighted (1.0 / 0.7 / 0.4) and shrunk
+   toward the position × age-group average using `w = games / (games + 8)`. Rookies use the positional
+   average as a prior; players over 30 decay 3%/yr.
+2. **PAR** — subtract replacement-level production (the last rostered player at each position, counting
+   bench depth: QB 18, RB 89, WR 114, TE 31) to get surplus value.
+3. **Auction conversion** — PAR surplus is scaled so the hittable budget ($2,208 = 12 × $200 minus a $1
+   minimum for each of 192 roster slots) is fully allocated, then blended 85% toward the expert value.
+4. **Live repricing** — once 3+ players at a position have sold, that position's factor
+   (median actual ÷ projected) adjusts remaining values; a global budget factor shrinks/inflates all
+   values proportionally.
+
+**Proj Pts** always comes from this model, so a player whose Proj Pts rank is far from their DS Value
+rank is worth a second look.
         """)
 
 # ─── Tab 2: Live Draft Input ──────────────────────────────────────────────────
